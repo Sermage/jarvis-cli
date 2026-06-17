@@ -1212,6 +1212,22 @@ def handle_plan_revision(task: Task, user_input: str) -> None:
     task.save()
 
 
+def announce_task_transitions(task: Task, prev_state: str) -> None:
+    """Если стадия изменилась во время advance_task — печатаем явное сообщение.
+    Помогает не пропустить validation→execution или достижение done.
+    """
+    if task.state == prev_state:
+        return
+    if task.state == TaskState.DONE:
+        print(f"\n{GREEN}{BOLD}✓ Задача #{task.id} завершена (validation OK).{RESET}\n")
+    elif prev_state == TaskState.VALIDATION and task.state == TaskState.EXECUTION:
+        print(f"\n{YELLOW}↻ Валидация нашла проблемы — возвращаемся к выполнению.{RESET}\n")
+    elif prev_state == TaskState.PLANNING and task.state == TaskState.EXECUTION:
+        print(f"\n{GREEN}→ Перешли к выполнению плана.{RESET}\n")
+    else:
+        print(f"\n{DIM}→ {prev_state} → {task.state}{RESET}\n")
+
+
 def show_task(task: Task):
     print(f"\n{BOLD}{MAGENTA}Задача #{task.id}:{RESET} {task.title}")
     print(f"  {DIM}запрос:{RESET} {task.request}")
@@ -1282,6 +1298,10 @@ def handle_task(cmd_str: str,
             print(f"{YELLOW}  Уже есть активная задача #{active.id} ({active.state}). "
                   f"Сначала /task abort или /task done.{RESET}")
             return
+        # Если active указывает на терминальную задачу — расчищаем перед стартом
+        # новой, чтобы дашборд не висел в неопределённом виде.
+        if active and active.is_terminal():
+            Task.clear_active()
         task = Task.new(
             request,
             profile=profile_name(_current_profile_path) if _current_profile_path else None,
@@ -1400,7 +1420,50 @@ def handle_task(cmd_str: str,
         print(f"{GREEN}  Задача #{task.id} завершена.{RESET}")
         return
 
-    print(f"{YELLOW}  Подкоманды /task: new · show · list · resume · advance · back · abort · done{RESET}")
+    if sub == "delete":
+        tid = parts[2].strip() if len(parts) > 2 else ""
+        if not tid:
+            print(f"{YELLOW}  Использование: /task delete <id>{RESET}")
+            return
+        t = Task.load(tid)
+        if not t:
+            # Файл задачи мог отсутствовать (никогда не сохранялась), но active
+            # pointer всё ещё может на неё указывать — почистим, чтобы дашборд
+            # не показывал «призрак».
+            if Task.get_active_id() == tid:
+                Task.clear_active()
+                print(f"{YELLOW}  Задача #{tid} не найдена на диске; active-указатель очищен.{RESET}")
+            else:
+                print(f"{YELLOW}  Задача #{tid} не найдена.{RESET}")
+            return
+        try:
+            confirm = input(f"  Удалить задачу #{t.id} «{t.title}»? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if confirm not in _YES:
+            print(f"{DIM}  Отменено.{RESET}")
+            return
+        t.delete()  # сама подчистит active pointer если нужно
+        print(f"{GREEN}  Задача #{tid} удалена.{RESET}")
+        return
+
+    if sub == "log":
+        tid = parts[2].strip() if len(parts) > 2 else ""
+        task = Task.load(tid) if tid else Task.get_active()
+        if not task:
+            print(f"{YELLOW}  {'Задача не найдена.' if tid else 'Активной задачи нет.'}{RESET}")
+            return
+        print(f"\n{BOLD}История задачи #{task.id}:{RESET}")
+        if not task.transitions:
+            print(f"  {DIM}переходов ещё не было{RESET}")
+        for tr in task.transitions:
+            reason = tr.get("reason", "") or ""
+            print(f"  {DIM}{tr.get('at','')}{RESET}  {tr['from']:10} → {tr['to']:10}  {DIM}{reason}{RESET}")
+        print()
+        return
+
+    print(f"{YELLOW}  Подкоманды /task: new · show · list · resume · advance · back · "
+          f"abort · done · delete · log{RESET}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1620,8 +1683,15 @@ def print_help():
   {CYAN}/task resume <id>{RESET}    — сделать другую задачу активной
   {CYAN}/task advance{RESET}        — перейти в следующую стадию вперёд
   {CYAN}/task back <стадия>{RESET}  — откатить на указанную стадию
+  {CYAN}/task log [id]{RESET}       — история переходов задачи
   {CYAN}/task abort{RESET}          — отменить задачу
   {CYAN}/task done{RESET}           — пометить задачу завершённой
+  {CYAN}/task delete <id>{RESET}    — удалить задачу с диска
+  {DIM}Шлюзы и автопереходы:
+    planning → execution     по «y» (или «n» → правки плана)
+    validation → done        по метке [VALIDATION OK] от модели
+    validation → execution   по метке [VALIDATION ISSUES] от модели
+    [QUESTION] в ответе      → задача переходит в режим ожидания ответа{RESET}
 
 {BOLD}Профиль:{RESET}
   {CYAN}/profile{RESET}         — сменить профиль агента
@@ -1781,6 +1851,7 @@ def main():
                     continue
                 # APPROVED → planning закрыт, мы уже в execution, сразу запускаем стадию.
                 print(f"{GREEN}  План утверждён. Перехожу к выполнению.{RESET}\n")
+                prev_state = active_task.state
                 try:
                     with Spinner("Думаю..."):
                         reply = advance_task(active_task, "", params,
@@ -1791,6 +1862,7 @@ def main():
                     continue
                 pending_restoration_hint = False
                 print(f"{BOLD}{GREEN}Agent:{RESET} {reply}\n")
+                announce_task_transitions(active_task, prev_state)
                 continue
 
             # === пользователь ответил на «что поправить?» ===
@@ -1801,6 +1873,7 @@ def main():
                     print(f"{YELLOW}  {e}{RESET}")
                     continue
                 # Сразу перегенерируем план.
+                prev_state = active_task.state
                 try:
                     with Spinner("Перепланирую..."):
                         reply = advance_task(active_task, "", params,
@@ -1811,9 +1884,11 @@ def main():
                     continue
                 pending_restoration_hint = False
                 print(f"{BOLD}{GREEN}Agent:{RESET} {reply}\n")
+                announce_task_transitions(active_task, prev_state)
                 continue
 
             # === обычный режим: stage prompt + (опционально) clarification ===
+            prev_state = active_task.state
             try:
                 with Spinner("Думаю..."):
                     reply = advance_task(active_task, user_input, params,
@@ -1839,6 +1914,7 @@ def main():
             pending_restoration_hint = False
             print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
             print()
+            announce_task_transitions(active_task, prev_state)
             continue
 
         # Краткосрочная память: добавляем сообщение пользователя
