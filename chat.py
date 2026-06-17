@@ -1167,6 +1167,10 @@ def show_task(task: Task):
     print(f"\n{BOLD}{MAGENTA}Задача #{task.id}:{RESET} {task.title}")
     print(f"  {DIM}запрос:{RESET} {task.request}")
     print(f"  {BOLD}стадия:{RESET} {task.state}")
+    if task.created_at or task.updated_at:
+        print(f"  {DIM}создана: {task.created_at}  обновлена: {task.updated_at}{RESET}")
+    if task.profile_snapshot or task.model_snapshot:
+        print(f"  {DIM}профиль: {task.profile_snapshot or '—'}  модель: {task.model_snapshot or '—'}{RESET}")
     if task.awaiting:
         print(f"  {YELLOW}ожидание ввода:{RESET} {task.awaiting}")
     if task.pending_questions:
@@ -1180,7 +1184,23 @@ def show_task(task: Task):
             if r is None:
                 continue
             mark = "◀" if s == task.state else " "
-            print(f"    {mark} {s}: {r.status}")
+            extra = ""
+            revs = r.artifacts.get("revisions") if r.artifacts else None
+            if revs:
+                extra += f"  ({len(revs)} версий до текущей)"
+            print(f"    {mark} {s}: {r.status}{extra}")
+    counts = []
+    if task.answers:
+        clar = sum(1 for a in task.answers if a.get("kind") == "clarification")
+        rev  = sum(1 for a in task.answers if a.get("kind") == "plan_revision")
+        if clar:
+            counts.append(f"{clar} уточн.")
+        if rev:
+            counts.append(f"{rev} правок плана")
+    if task.transitions:
+        counts.append(f"{len(task.transitions)} переходов")
+    if counts:
+        print(f"  {DIM}история: {', '.join(counts)}{RESET}")
     if task.transitions:
         last = task.transitions[-1]
         print(f"  {DIM}последний переход: {last['from']} → {last['to']} ({last.get('reason','')}){RESET}")
@@ -1247,7 +1267,9 @@ def handle_task(cmd_str: str,
         print(f"\n{BOLD}Задачи:{RESET}")
         for t in tasks:
             mark = f" {YELLOW}◀ активная{RESET}" if t.id == active_id else ""
-            print(f"  {CYAN}#{t.id}{RESET}  {t.state:10}  {t.title}{mark}")
+            title = t.title[:50] + ("…" if len(t.title) > 50 else "")
+            updated = t.updated_at or "—"
+            print(f"  {CYAN}#{t.id}{RESET}  {t.state:10}  {DIM}{updated}{RESET}  {title}{mark}")
         print()
         return
 
@@ -1410,8 +1432,25 @@ def print_settings(params: dict):
     pname = profile_name(_current_profile_path) if _current_profile_path else "нет"
     print(f"{DIM}  модель: {params['model']}  temperature: {temp}  max_tokens: {maxt}  профиль: {pname}{RESET}")
 
+def _task_status_badge() -> str:
+    """Однострочный индикатор активной задачи для общего дашборда."""
+    task = Task.get_active()
+    if not task or task.is_terminal():
+        return f"{DIM}задача: —{RESET}"
+    short = task.title[:30] + ("…" if len(task.title) > 30 else "")
+    extras = []
+    if task.awaiting == "plan_approval":
+        extras.append("ждёт y/n плана")
+    elif task.awaiting == "plan_revision_input":
+        extras.append("ждёт правок плана")
+    elif task.pending_questions:
+        extras.append(f"{len(task.pending_questions)} вопр.")
+    suffix = f" · {', '.join(extras)}" if extras else ""
+    return f"{YELLOW}задача: #{task.id} {task.state} · {short}{suffix}{RESET}"
+
+
 def print_memory_status(messages: list, wm: WorkingMemory):
-    """Однострочный дашборд трёх слоёв памяти."""
+    """Однострочный дашборд всех слоёв памяти + активная задача."""
     # краткосрочная
     st_label = f"{GREEN}краткосрочная: {len(messages)} сообщ.{RESET}" if messages \
                else f"{DIM}краткосрочная: —{RESET}"
@@ -1424,8 +1463,10 @@ def print_memory_status(messages: list, wm: WorkingMemory):
     if kfiles:
         lt_label += f", {len(kfiles)} знаний"
     lt_label += RESET
+    # задача
+    task_label = _task_status_badge()
 
-    print(f"  {st_label}  │  {wm_label}  │  {lt_label}")
+    print(f"  {st_label}  │  {wm_label}  │  {lt_label}  │  {task_label}")
 
 def print_mem_detail(messages: list, wm: WorkingMemory):
     """Подробный вывод всех трёх слоёв."""
@@ -1458,6 +1499,22 @@ def print_mem_detail(messages: list, wm: WorkingMemory):
             print(f"      {BLUE}•{RESET} {os.path.splitext(fname)[0]}")
     else:
         print(f"    {DIM}База знаний пуста. Используй /know save{RESET}")
+
+    # Слой 4
+    print(f"\n{BOLD}{YELLOW}[4] Задача{RESET}  {DIM}(машина состояний){RESET}")
+    active = Task.get_active()
+    if active and not active.is_terminal():
+        print(f"    Активная: #{active.id} «{active.title}» (стадия: {active.state})")
+        if active.awaiting:
+            print(f"    {YELLOW}Ожидание ввода:{RESET} {active.awaiting}")
+    else:
+        print(f"    {DIM}Активной задачи нет.{RESET}")
+    all_tasks = Task.list_all()
+    if all_tasks:
+        nonterm = sum(1 for t in all_tasks if not t.is_terminal())
+        done    = sum(1 for t in all_tasks if t.state == TaskState.DONE)
+        abort   = sum(1 for t in all_tasks if t.state == TaskState.ABORTED)
+        print(f"    {DIM}всего задач: {len(all_tasks)} (активные: {nonterm}, done: {done}, aborted: {abort}){RESET}")
     print()
 
 def choose_model(params: dict):
