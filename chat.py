@@ -924,19 +924,51 @@ STAGE_PROMPTS = {
         "Сейчас стадия VALIDATION — проверка результата.\n"
         "Сверь сделанное с утверждённым планом и исходным запросом.\n"
         "Перечисли найденные проблемы конкретными пунктами; если проблем нет — скажи прямо, что всё в порядке.\n"
-        "Если для проверки не хватает данных — задай уточняющий вопрос (см. ПРАВИЛО УТОЧНЕНИЙ)."
+        "Если для проверки не хватает данных — задай уточняющий вопрос (см. ПРАВИЛО УТОЧНЕНИЙ).\n"
+        "\n"
+        "Заверши ответ ОДНОЙ из меток ровно на отдельной строке:\n"
+        "  [VALIDATION OK]     — если проблем не найдено и задачу можно завершать;\n"
+        "  [VALIDATION ISSUES] — если есть проблемы (они перечислены выше, нужно вернуться к выполнению).\n"
+        "Без [QUESTION] и без обеих меток сразу. Если есть незакрытые [QUESTION] — метку НЕ ставь."
     ),
 }
 
 # Маркер вопроса: строка, начинающаяся с [QUESTION]. Захватываем всё до следующего
-# такого тега или до конца текста, поддерживая многострочные формулировки.
-_QUESTION_RE = re.compile(r"^\s*\[QUESTION\]\s*(.+?)(?=^\s*\[QUESTION\]|\Z)",
-                          re.MULTILINE | re.DOTALL)
+# тега-в-начале-строки (любой [XXX] из заглавных букв/пробелов) или до конца текста,
+# поддерживая многострочные формулировки. Тег-разделитель шире, чем сам [QUESTION],
+# чтобы корректно отделять вопросы от меток вердикта вроде [VALIDATION OK].
+_QUESTION_RE = re.compile(
+    r"^\s*\[QUESTION\]\s*(.+?)(?=^\s*\[[A-Z][A-Z _]*\]|\Z)",
+    re.MULTILINE | re.DOTALL)
 
 
 def parse_questions(text: str) -> list:
     """Извлекает вопросы агента из ответа модели."""
     return [m.strip() for m in _QUESTION_RE.findall(text) if m.strip()]
+
+
+# Метки вердикта стадии validation. Якорим на начало строки, чтобы случайные
+# упоминания «[VALIDATION OK]» внутри прозы не триггерили автопереход.
+_VALIDATION_OK_RE = re.compile(
+    r"^\s*\[VALIDATION\s+OK\]\s*$", re.MULTILINE | re.IGNORECASE)
+_VALIDATION_ISSUES_RE = re.compile(
+    r"^\s*\[VALIDATION\s+(?:ISSUES|FAILED|FAIL|NOK)\]\s*$",
+    re.MULTILINE | re.IGNORECASE)
+
+
+def parse_validation_verdict(text: str) -> Optional[str]:
+    """Возвращает 'ok', 'issues' или None (вердикт не задан).
+
+    Если в ответе одновременно есть обе метки — приоритет у issues
+    (безопаснее: лучше пройти ещё один круг execution, чем закрыть с проблемами).
+    """
+    has_issues = bool(_VALIDATION_ISSUES_RE.search(text))
+    has_ok     = bool(_VALIDATION_OK_RE.search(text))
+    if has_issues:
+        return "issues"
+    if has_ok:
+        return "ok"
+    return None
 
 # Порядок стадий «вперёд» — нужен для построения контекста и команды /task advance.
 _STAGE_ORDER = [
@@ -1068,20 +1100,37 @@ def advance_task(task: Task,
         task.pending_questions = questions
         task.awaiting = "clarification"
         stage_obj.status = StageStatus.AWAITING_USER
-    elif task.state == TaskState.PLANNING:
+        task.stages[task.state] = stage_obj
+        task.save()
+        return reply
+
+    if task.state == TaskState.PLANNING:
         # План готов — стадия не закрывается, ждём явного y/n от пользователя.
         # finished_at выставится позже, в handle_plan_approval после "y".
         task.pending_questions = []
         task.awaiting = "plan_approval"
         stage_obj.status = StageStatus.AWAITING_USER
-    else:
-        task.pending_questions = []
-        task.awaiting = None
-        stage_obj.status = StageStatus.DONE
-        stage_obj.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        task.stages[task.state] = stage_obj
+        task.save()
+        return reply
 
+    # Стадия отработала без вопросов — закрываем её.
+    task.pending_questions = []
+    task.awaiting = None
+    stage_obj.status = StageStatus.DONE
+    stage_obj.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
     task.stages[task.state] = stage_obj
     task.save()
+
+    # Стадия validation: автоматический переход по вердикту модели.
+    if task.state == TaskState.VALIDATION:
+        verdict = parse_validation_verdict(reply)
+        if verdict == "ok":
+            task.transition(TaskState.DONE, reason="валидация пройдена")
+        elif verdict == "issues":
+            task.transition(TaskState.EXECUTION, reason="валидация выявила проблемы")
+        # verdict == None — оставляем validation done, пользователь решит руками.
+
     return reply
 
 
