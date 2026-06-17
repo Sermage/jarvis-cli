@@ -184,6 +184,72 @@ def create_profile() -> tuple:
     print(f"{GREEN}Профиль «{safe_name}» загружен.{RESET}")
     return path, text
 
+def edit_profile() -> tuple:
+    profiles = list_profiles()
+    if not profiles:
+        print(f"{YELLOW}Нет профилей для редактирования.{RESET}")
+        return _current_profile_path, _current_profile_text
+
+    print(f"\n{BOLD}Выберите профиль для редактирования:{RESET}")
+    for i, p in enumerate(profiles, 1):
+        marker = " ◀" if p == _current_profile_path else ""
+        print(f"  {CYAN}{i}{RESET}. {profile_name(p)}{marker}")
+    try:
+        choice = input("Номер (Enter — отмена): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return _current_profile_path, _current_profile_text
+
+    if not (choice.isdigit() and 1 <= int(choice) <= len(profiles)):
+        return _current_profile_path, _current_profile_text
+
+    path = profiles[int(choice) - 1]
+    print(f"{DIM}Открываю редактор…{RESET}")
+    open_in_editor(path)
+    text = load_profile(path)
+    if path == _current_profile_path:
+        print(f"{GREEN}Профиль «{profile_name(path)}» обновлён и перезагружен.{RESET}")
+        return path, text
+    print(f"{GREEN}Профиль «{profile_name(path)}» сохранён.{RESET}")
+    return _current_profile_path, _current_profile_text
+
+
+def delete_profile() -> tuple:
+    profiles = list_profiles()
+    if not profiles:
+        print(f"{YELLOW}Нет профилей для удаления.{RESET}")
+        return _current_profile_path, _current_profile_text
+
+    print(f"\n{BOLD}Выберите профиль для удаления:{RESET}")
+    for i, p in enumerate(profiles, 1):
+        marker = f" {YELLOW}◀ активный{RESET}" if p == _current_profile_path else ""
+        print(f"  {CYAN}{i}{RESET}. {profile_name(p)}{marker}")
+    try:
+        choice = input("Номер (Enter — отмена): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return _current_profile_path, _current_profile_text
+
+    if not (choice.isdigit() and 1 <= int(choice) <= len(profiles)):
+        return _current_profile_path, _current_profile_text
+
+    path = profiles[int(choice) - 1]
+    name = profile_name(path)
+    try:
+        confirm = input(f"Удалить «{name}»? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return _current_profile_path, _current_profile_text
+
+    if confirm != "y":
+        print(f"{DIM}Отменено.{RESET}")
+        return _current_profile_path, _current_profile_text
+
+    os.remove(path)
+    print(f"{GREEN}Профиль «{name}» удалён.{RESET}")
+    if path == _current_profile_path:
+        print(f"{YELLOW}Активный профиль удалён — профиль сброшен.{RESET}")
+        return None, None
+    return _current_profile_path, _current_profile_text
+
+
 def choose_profile() -> tuple:
     profiles = list_profiles()
     if not profiles:
@@ -716,6 +782,8 @@ def print_help():
 {BOLD}Профиль:{RESET}
   {CYAN}/profile{RESET}         — сменить профиль агента
   {CYAN}/profile new{RESET}     — создать новый профиль
+  {CYAN}/profile edit{RESET}    — редактировать профиль
+  {CYAN}/profile delete{RESET}  — удалить профиль
 
 {BOLD}Обзор:{RESET}
   {CYAN}/mem{RESET}             — показать все слои памяти
@@ -811,6 +879,10 @@ def main():
                 handle_know(user_input)
             elif cmd == "/profile new":
                 _current_profile_path, _current_profile_text = create_profile()
+            elif cmd == "/profile edit":
+                _current_profile_path, _current_profile_text = edit_profile()
+            elif cmd == "/profile delete":
+                _current_profile_path, _current_profile_text = delete_profile()
             elif cmd == "/profile":
                 _current_profile_path, _current_profile_text = choose_profile()
             elif cmd == "/clear":
