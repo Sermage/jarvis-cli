@@ -7,3 +7,6 @@ dist/
 build/
 .DS_Store
 ~/.jarvis/
+.pytest_cache/
+.coverage
+htmlcov/
