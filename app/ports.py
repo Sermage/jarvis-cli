@@ -41,3 +41,12 @@ class SessionRepository(Protocol):
     def path_for(self, session_id: str) -> str:
         """Абсолютный путь к файлу сессии (нужен UI для отображения)."""
         ...
+
+
+class GigaChatClient(Protocol):
+    """Клиент модели. Скрывает OAuth, токен-кэш и HTTP-транспорт."""
+
+    def chat(self,
+             messages: list,
+             params: dict,
+             system_prompt: Optional[str] = None) -> str: ...

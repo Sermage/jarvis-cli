@@ -27,6 +27,8 @@ from domain.profile import (
 from domain.knowledge import sanitize_knowledge_name
 from infra.working_memory_repository import FileWorkingMemoryRepository
 from infra.session_repository import FileSessionRepository
+from infra.gigachat_client import RequestsGigaChatClient
+from app.ports import GigaChatClient
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -701,6 +703,7 @@ def advance_task(task: Task,
                  params: dict,
                  profile_text: Optional[str],
                  wm: "WorkingMemory",
+                 client: GigaChatClient,
                  restoration_hint: bool = False) -> str:
     """Один прогон текущей стадии через модель.
 
@@ -754,7 +757,7 @@ def advance_task(task: Task,
         stage_messages.append({"role": "user", "content": followup_message})
 
     try:
-        reply = chat(stage_messages, params, system_prompt)
+        reply = client.chat(stage_messages, params, system_prompt)
     except Exception:
         stage_obj.status = StageStatus.FAILED
         task.save()
@@ -956,7 +959,8 @@ def show_task(task: Task):
 def handle_task(cmd_str: str,
                 params: dict,
                 profile_text: Optional[str],
-                wm: "WorkingMemory") -> None:
+                wm: "WorkingMemory",
+                client: GigaChatClient) -> None:
     """Обработка /task <sub> ..."""
     parts = cmd_str.split(None, 2)
     sub = parts[1].lower() if len(parts) > 1 else "show"
@@ -990,7 +994,7 @@ def handle_task(cmd_str: str,
         print(f"{GREEN}  Создана задача #{task.id} (стадия: {task.state}).{RESET}")
         try:
             with Spinner("Думаю..."):
-                reply = advance_task(task, request, params, profile_text, wm)
+                reply = advance_task(task, request, params, profile_text, wm, client)
         except Exception as e:
             print(f"{YELLOW}  Ошибка стадии: {e}{RESET}")
             return
@@ -1167,53 +1171,9 @@ def build_system_prompt(profile_text: Optional[str], wm: WorkingMemory) -> Optio
 
     return "\n\n".join(parts) if parts else None
 
-# ── Token cache ───────────────────────────────────────────────────────────────
-_token = None
-_token_expires_at: float = 0.0
-TOKEN_EXPIRY_BUFFER = 60
-
-def get_token() -> str:
-    global _token, _token_expires_at
-    if _token and time.time() < _token_expires_at - TOKEN_EXPIRY_BUFFER:
-        return _token
-    resp = requests.post(
-        OAUTH_URL,
-        headers={
-            "Authorization": f"Basic {AUTH_KEY}",
-            "RqUID": str(uuid.uuid4()),
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data={"scope": SCOPE},
-        verify=False,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    _token = data["access_token"]
-    _token_expires_at = data["expires_at"] / 1000
-    return _token
-
-# ── Chat ──────────────────────────────────────────────────────────────────────
-def chat(messages: list, params: dict, system_prompt: Optional[str] = None) -> str:
-    token = get_token()
-    api_messages = messages
-    if system_prompt:
-        api_messages = [{"role": "system", "content": system_prompt}] + messages
-    body = {"model": params["model"], "messages": api_messages}
-    if params["temperature"] is not None:
-        body["temperature"] = params["temperature"]
-    if params["max_tokens"] is not None:
-        body["max_tokens"] = params["max_tokens"]
-
-    resp = requests.post(
-        CHAT_URL,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json=body,
-        verify=False,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+# ── HTTP / GigaChat ───────────────────────────────────────────────────────────
+# OAuth, токен-кэш и вызов модели — в infra.gigachat_client.RequestsGigaChatClient.
+# Экземпляр собирается в main() и прокидывается явным параметром.
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 def print_settings(params: dict):
@@ -1401,6 +1361,12 @@ def main():
     # Composition root: собираем инфраструктурные зависимости.
     wm_repo      = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
     session_repo = FileSessionRepository(HISTORY_DIR, MAX_SESSIONS)
+    client       = RequestsGigaChatClient(
+        auth_key  = AUTH_KEY,
+        oauth_url = OAUTH_URL,
+        chat_url  = CHAT_URL,
+        scope     = SCOPE,
+    )
 
     print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}\n")
 
@@ -1501,7 +1467,7 @@ def main():
             elif cmd.startswith("/know"):
                 handle_know(user_input)
             elif cmd.startswith("/task"):
-                handle_task(user_input, params, _current_profile_text, wm)
+                handle_task(user_input, params, _current_profile_text, wm, client)
             elif cmd == "/profile new":
                 _current_profile_path, _current_profile_text = create_profile()
             elif cmd == "/profile edit":
@@ -1544,7 +1510,7 @@ def main():
                 try:
                     with Spinner("Думаю..."):
                         reply = advance_task(active_task, "", params,
-                                             _current_profile_text, wm,
+                                             _current_profile_text, wm, client,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -1566,7 +1532,7 @@ def main():
                 try:
                     with Spinner("Перепланирую..."):
                         reply = advance_task(active_task, "", params,
-                                             _current_profile_text, wm,
+                                             _current_profile_text, wm, client,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -1581,7 +1547,7 @@ def main():
             try:
                 with Spinner("Думаю..."):
                     reply = advance_task(active_task, user_input, params,
-                                         _current_profile_text, wm,
+                                         _current_profile_text, wm, client,
                                          restoration_hint=pending_restoration_hint)
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
@@ -1614,7 +1580,7 @@ def main():
 
         try:
             with Spinner("Думаю..."):
-                reply = chat(messages, params, system_prompt)
+                reply = client.chat(messages, params, system_prompt)
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
             try:
