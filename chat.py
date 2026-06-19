@@ -25,6 +25,7 @@ from domain.profile import (
     sanitize_profile_name,
 )
 from domain.knowledge import sanitize_knowledge_name
+from infra.working_memory_repository import FileWorkingMemoryRepository
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -297,88 +298,54 @@ def list_knowledge() -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 # СЛОЙ 2 — РАБОЧАЯ ПАМЯТЬ: контекст текущей задачи
 # ══════════════════════════════════════════════════════════════════════════════
-class WorkingMemory(_DomainWorkingMemory):
-    """Рабочая память + файловая персистентность и ANSI-вывод.
+# Модель — domain.working_memory.WorkingMemory.
+# Хранилище — infra.working_memory_repository.FileWorkingMemoryRepository.
+# UI-функции ниже останутся здесь до выделения слоя cli/.
 
-    Чистая модель данных и сборка system-prompt-блока — в `domain.working_memory`.
-    """
-
-    _FILE = os.path.join(WORKING_DIR, "current.json")
-
-    # ── persistence ──────────────────────────────────────────────────────────
-
-    def load(self) -> "WorkingMemory":
-        if os.path.exists(self._FILE):
-            try:
-                with open(self._FILE, encoding="utf-8") as f:
-                    d = json.load(f)
-                self.task       = d.get("task")
-                self.context    = d.get("context", {})
-                self.notes      = d.get("notes", [])
-                self.created_at = d.get("created_at")
-                self.updated_at = d.get("updated_at")
-            except Exception:
-                pass
-        return self
-
-    def save(self):
-        os.makedirs(WORKING_DIR, exist_ok=True)
-        now = time.strftime("%Y-%m-%d %H:%M")
-        if not self.created_at:
-            self.created_at = now
-        self.updated_at = now
-        with open(self._FILE, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-
-    def clear(self):
-        self.task = self.created_at = self.updated_at = None
-        self.context = {}
-        self.notes   = []
-        if os.path.exists(self._FILE):
-            os.remove(self._FILE)
-
-    # ── UI ───────────────────────────────────────────────────────────────────
-
-    def show(self):
-        if self.is_empty():
-            print(f"    {DIM}пусто{RESET}")
-            return
-        if self.task:
-            print(f"    {BOLD}Задача:{RESET} {self.task}")
-        if self.context:
-            print(f"    {BOLD}Контекст:{RESET}")
-            for k, v in self.context.items():
-                print(f"      {CYAN}{k}{RESET}: {v}")
-        if self.notes:
-            print(f"    {BOLD}Заметки:{RESET}")
-            for note in self.notes:
-                print(f"      • {note}")
-        if self.updated_at:
-            print(f"    {DIM}обновлено: {self.updated_at}{RESET}")
-
-    def status_badge(self) -> str:
-        """Однострочный индикатор для строки статуса."""
-        if self.is_empty():
-            return f"{DIM}рабочая: —{RESET}"
-        parts = []
-        if self.task:
-            short = self.task[:30] + ("…" if len(self.task) > 30 else "")
-            parts.append(short)
-        if self.context:
-            parts.append(f"{len(self.context)} ключ.")
-        if self.notes:
-            parts.append(f"{len(self.notes)} заметок")
-        return f"{MAGENTA}рабочая: {', '.join(parts)}{RESET}"
+WorkingMemory = _DomainWorkingMemory  # переходный алиас: убрать при переезде вызовов
 
 
-def handle_wm(cmd_str: str, wm: WorkingMemory):
+def wm_show(wm: WorkingMemory) -> None:
+    if wm.is_empty():
+        print(f"    {DIM}пусто{RESET}")
+        return
+    if wm.task:
+        print(f"    {BOLD}Задача:{RESET} {wm.task}")
+    if wm.context:
+        print(f"    {BOLD}Контекст:{RESET}")
+        for k, v in wm.context.items():
+            print(f"      {CYAN}{k}{RESET}: {v}")
+    if wm.notes:
+        print(f"    {BOLD}Заметки:{RESET}")
+        for note in wm.notes:
+            print(f"      • {note}")
+    if wm.updated_at:
+        print(f"    {DIM}обновлено: {wm.updated_at}{RESET}")
+
+
+def wm_status_badge(wm: WorkingMemory) -> str:
+    """Однострочный индикатор для строки статуса."""
+    if wm.is_empty():
+        return f"{DIM}рабочая: —{RESET}"
+    parts = []
+    if wm.task:
+        short = wm.task[:30] + ("…" if len(wm.task) > 30 else "")
+        parts.append(short)
+    if wm.context:
+        parts.append(f"{len(wm.context)} ключ.")
+    if wm.notes:
+        parts.append(f"{len(wm.notes)} заметок")
+    return f"{MAGENTA}рабочая: {', '.join(parts)}{RESET}"
+
+
+def handle_wm(cmd_str: str, wm: WorkingMemory, wm_repo: FileWorkingMemoryRepository):
     """Обрабатывает /wm <sub> <args>."""
     parts = cmd_str.split(None, 2)
     sub   = parts[1].lower() if len(parts) > 1 else "show"
 
     if sub in ("show", ""):
         print(f"\n{BOLD}{MAGENTA}Рабочая память:{RESET}")
-        wm.show()
+        wm_show(wm)
         print()
 
     elif sub == "task":
@@ -390,7 +357,7 @@ def handle_wm(cmd_str: str, wm: WorkingMemory):
                 return
         if desc:
             wm.task = desc
-            wm.save()
+            wm_repo.save(wm)
             print(f"{GREEN}  Задача установлена.{RESET}")
 
     elif sub == "set":
@@ -400,7 +367,7 @@ def handle_wm(cmd_str: str, wm: WorkingMemory):
             print(f"{YELLOW}  Использование: /wm set <ключ> <значение>{RESET}")
         else:
             wm.context[kv[0]] = kv[1]
-            wm.save()
+            wm_repo.save(wm)
             print(f"{GREEN}  Сохранено: {kv[0]} = {kv[1]}{RESET}")
 
     elif sub == "note":
@@ -412,20 +379,23 @@ def handle_wm(cmd_str: str, wm: WorkingMemory):
                 return
         if text:
             wm.notes.append(text)
-            wm.save()
+            wm_repo.save(wm)
             print(f"{GREEN}  Заметка добавлена.{RESET}")
 
     elif sub == "del":
         key = parts[2].strip() if len(parts) > 2 else ""
         if key in wm.context:
             del wm.context[key]
-            wm.save()
+            wm_repo.save(wm)
             print(f"{GREEN}  Ключ «{key}» удалён.{RESET}")
         else:
             print(f"{YELLOW}  Ключ «{key}» не найден.{RESET}")
 
     elif sub == "clear":
-        wm.clear()
+        wm_repo.clear()
+        wm.task = wm.created_at = wm.updated_at = None
+        wm.context.clear()
+        wm.notes.clear()
         print(f"{DIM}  Рабочая память очищена.{RESET}")
 
     else:
@@ -1337,7 +1307,7 @@ def print_memory_status(messages: list, wm: WorkingMemory):
     st_label = f"{GREEN}краткосрочная: {len(messages)} сообщ.{RESET}" if messages \
                else f"{DIM}краткосрочная: —{RESET}"
     # рабочая
-    wm_label = wm.status_badge()
+    wm_label = wm_status_badge(wm)
     # долговременная
     pname  = profile_name(_current_profile_path) if _current_profile_path else "нет"
     kfiles = list_knowledge()
@@ -1368,7 +1338,7 @@ def print_mem_detail(messages: list, wm: WorkingMemory):
 
     # Слой 2
     print(f"\n{BOLD}{MAGENTA}[2] Рабочая память{RESET}  {DIM}(задача и контекст){RESET}")
-    wm.show()
+    wm_show(wm)
 
     # Слой 3
     print(f"\n{BOLD}{BLUE}[3] Долговременная память{RESET}  {DIM}(профиль + знания){RESET}")
@@ -1486,6 +1456,8 @@ def main():
 
     global _current_session_file, _current_profile_path, _current_profile_text
 
+    wm_repo = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
+
     print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}\n")
 
     if not AUTH_KEY:
@@ -1500,10 +1472,10 @@ def main():
     _current_profile_text = load_profile(default_profile)
 
     # Инициализация рабочей памяти
-    wm = WorkingMemory().load()
+    wm = wm_repo.load()
     if not wm.is_empty():
         print(f"{MAGENTA}Рабочая память загружена:{RESET}")
-        wm.show()
+        wm_show(wm)
         print()
 
     # Выбор краткосрочной памяти (сессии)
@@ -1581,7 +1553,7 @@ def main():
             elif cmd == "/mem":
                 print_mem_detail(messages, wm)
             elif cmd.startswith("/wm"):
-                handle_wm(user_input, wm)
+                handle_wm(user_input, wm, wm_repo)
             elif cmd.startswith("/know"):
                 handle_know(user_input)
             elif cmd.startswith("/task"):
