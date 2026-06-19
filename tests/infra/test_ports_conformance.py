@@ -8,11 +8,15 @@ import inspect
 
 from app.ports import (
     GigaChatClient,
+    KnowledgeRepository,
+    ProfileRepository,
     SessionRepository,
     TaskRepository,
     WorkingMemoryRepository,
 )
 from infra.gigachat_client import RequestsGigaChatClient
+from infra.knowledge_repository import FileKnowledgeRepository
+from infra.profile_repository import FileProfileRepository
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
 from infra.working_memory_repository import FileWorkingMemoryRepository
@@ -49,4 +53,16 @@ def test_requests_gigachat_client_covers_port():
 def test_file_task_repository_covers_port(tmp_path):
     repo = FileTaskRepository(dir_path=str(tmp_path / "tasks"))
     for name in _methods(TaskRepository):
+        assert callable(getattr(repo, name)), f"missing method: {name}"
+
+
+def test_file_profile_repository_covers_port(tmp_path):
+    repo = FileProfileRepository(dir_path=str(tmp_path / "profiles"))
+    for name in _methods(ProfileRepository):
+        assert callable(getattr(repo, name)), f"missing method: {name}"
+
+
+def test_file_knowledge_repository_covers_port(tmp_path):
+    repo = FileKnowledgeRepository(dir_path=str(tmp_path / "knowledge"))
+    for name in _methods(KnowledgeRepository):
         assert callable(getattr(repo, name)), f"missing method: {name}"

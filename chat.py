@@ -29,7 +29,16 @@ from infra.working_memory_repository import FileWorkingMemoryRepository
 from infra.session_repository import FileSessionRepository
 from infra.gigachat_client import RequestsGigaChatClient
 from infra.task_repository import FileTaskRepository
-from app.ports import GigaChatClient, TaskRepository
+from infra.profile_repository import FileProfileRepository
+from infra.knowledge_repository import FileKnowledgeRepository
+from app.ports import (
+    GigaChatClient,
+    KnowledgeRepository,
+    ProfileRepository,
+    TaskRepository,
+)
+from domain.profile import Profile
+from domain.knowledge import KnowledgeEntry
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -115,189 +124,132 @@ class Spinner:
 # ══════════════════════════════════════════════════════════════════════════════
 # СЛОЙ 3 — ДОЛГОВРЕМЕННАЯ ПАМЯТЬ: профили + база знаний
 # ══════════════════════════════════════════════════════════════════════════════
-_current_profile_path = None
-_current_profile_text = None
-
-def list_profiles() -> list:
-    if not os.path.isdir(PROFILES_DIR):
-        return []
-    return sorted([
-        os.path.join(PROFILES_DIR, f)
-        for f in os.listdir(PROFILES_DIR)
-        if f.endswith(".md")
-    ])
-
-def load_profile(path: str) -> str:
-    with open(path, encoding="utf-8") as f:
-        return f.read().strip()
-
-def ensure_default_profile() -> str:
-    os.makedirs(PROFILES_DIR, exist_ok=True)
-    default = os.path.join(PROFILES_DIR, "default.md")
-    if not os.path.exists(default):
-        with open(default, "w", encoding="utf-8") as f:
-            f.write(DEFAULT_PROFILE_CONTENT)
-    return default
-
-def profile_name(path: str) -> str:
-    return os.path.splitext(os.path.basename(path))[0]
+# Хранилища — infra.profile_repository.FileProfileRepository и
+# infra.knowledge_repository.FileKnowledgeRepository.
+# Активный профиль живёт как локальная переменная current_profile в main().
 
 def open_in_editor(path: str):
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
     subprocess.call([editor, path])
 
-def create_profile() -> tuple:
+
+def create_profile(repo: ProfileRepository,
+                   current: Optional[Profile]) -> Optional[Profile]:
     try:
-        name = input("Название профиля (например, android-dev): ").strip()
+        raw = input("Название профиля (например, android-dev): ").strip()
     except (EOFError, KeyboardInterrupt):
-        return _current_profile_path, _current_profile_text
-
-    if not name:
+        return current
+    if not raw:
         print(f"{YELLOW}Название не может быть пустым.{RESET}")
-        return _current_profile_path, _current_profile_text
+        return current
 
-    safe_name = sanitize_profile_name(name)
-    path = os.path.join(PROFILES_DIR, f"{safe_name}.md")
-
-    if os.path.exists(path):
-        print(f"{YELLOW}Профиль «{safe_name}» уже существует.{RESET}")
+    name = sanitize_profile_name(raw)
+    if repo.exists(name):
+        print(f"{YELLOW}Профиль «{name}» уже существует.{RESET}")
     else:
-        os.makedirs(PROFILES_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(PROFILE_TEMPLATE.format(name=name))
+        repo.save(Profile.from_template(raw))
 
     print(f"{DIM}Открываю редактор…{RESET}")
-    open_in_editor(path)
+    open_in_editor(repo.path_for(name))
 
-    text = load_profile(path)
-    print(f"{GREEN}Профиль «{safe_name}» загружен.{RESET}")
-    return path, text
+    loaded = repo.load(name)
+    print(f"{GREEN}Профиль «{name}» загружен.{RESET}")
+    return loaded
 
-def edit_profile() -> tuple:
-    profiles = list_profiles()
-    if not profiles:
+
+def edit_profile(repo: ProfileRepository,
+                 current: Optional[Profile]) -> Optional[Profile]:
+    names = repo.list_names()
+    if not names:
         print(f"{YELLOW}Нет профилей для редактирования.{RESET}")
-        return _current_profile_path, _current_profile_text
+        return current
 
     print(f"\n{BOLD}Выберите профиль для редактирования:{RESET}")
-    for i, p in enumerate(profiles, 1):
-        marker = " ◀" if p == _current_profile_path else ""
-        print(f"  {CYAN}{i}{RESET}. {profile_name(p)}{marker}")
+    for i, n in enumerate(names, 1):
+        marker = " ◀" if current and n == current.name else ""
+        print(f"  {CYAN}{i}{RESET}. {n}{marker}")
     try:
         choice = input("Номер (Enter — отмена): ").strip()
     except (EOFError, KeyboardInterrupt):
-        return _current_profile_path, _current_profile_text
+        return current
+    if not (choice.isdigit() and 1 <= int(choice) <= len(names)):
+        return current
 
-    if not (choice.isdigit() and 1 <= int(choice) <= len(profiles)):
-        return _current_profile_path, _current_profile_text
-
-    path = profiles[int(choice) - 1]
+    target = names[int(choice) - 1]
     print(f"{DIM}Открываю редактор…{RESET}")
-    open_in_editor(path)
-    text = load_profile(path)
-    if path == _current_profile_path:
-        print(f"{GREEN}Профиль «{profile_name(path)}» обновлён и перезагружен.{RESET}")
-        return path, text
-    print(f"{GREEN}Профиль «{profile_name(path)}» сохранён.{RESET}")
-    return _current_profile_path, _current_profile_text
+    open_in_editor(repo.path_for(target))
+
+    if current and target == current.name:
+        loaded = repo.load(target)
+        print(f"{GREEN}Профиль «{target}» обновлён и перезагружен.{RESET}")
+        return loaded
+    print(f"{GREEN}Профиль «{target}» сохранён.{RESET}")
+    return current
 
 
-def delete_profile() -> tuple:
-    profiles = list_profiles()
-    if not profiles:
+def delete_profile(repo: ProfileRepository,
+                   current: Optional[Profile]) -> Optional[Profile]:
+    names = repo.list_names()
+    if not names:
         print(f"{YELLOW}Нет профилей для удаления.{RESET}")
-        return _current_profile_path, _current_profile_text
+        return current
 
     print(f"\n{BOLD}Выберите профиль для удаления:{RESET}")
-    for i, p in enumerate(profiles, 1):
-        marker = f" {YELLOW}◀ активный{RESET}" if p == _current_profile_path else ""
-        print(f"  {CYAN}{i}{RESET}. {profile_name(p)}{marker}")
+    for i, n in enumerate(names, 1):
+        marker = f" {YELLOW}◀ активный{RESET}" if current and n == current.name else ""
+        print(f"  {CYAN}{i}{RESET}. {n}{marker}")
     try:
         choice = input("Номер (Enter — отмена): ").strip()
     except (EOFError, KeyboardInterrupt):
-        return _current_profile_path, _current_profile_text
+        return current
+    if not (choice.isdigit() and 1 <= int(choice) <= len(names)):
+        return current
 
-    if not (choice.isdigit() and 1 <= int(choice) <= len(profiles)):
-        return _current_profile_path, _current_profile_text
-
-    path = profiles[int(choice) - 1]
-    name = profile_name(path)
+    target = names[int(choice) - 1]
     try:
-        confirm = input(f"Удалить «{name}»? [y/N]: ").strip().lower()
+        confirm = input(f"Удалить «{target}»? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        return _current_profile_path, _current_profile_text
-
+        return current
     if confirm != "y":
         print(f"{DIM}Отменено.{RESET}")
-        return _current_profile_path, _current_profile_text
+        return current
 
-    os.remove(path)
-    print(f"{GREEN}Профиль «{name}» удалён.{RESET}")
-    if path == _current_profile_path:
+    repo.delete(target)
+    print(f"{GREEN}Профиль «{target}» удалён.{RESET}")
+    if current and target == current.name:
         print(f"{YELLOW}Активный профиль удалён — профиль сброшен.{RESET}")
-        return None, None
-    return _current_profile_path, _current_profile_text
+        return None
+    return current
 
 
-def choose_profile() -> tuple:
-    profiles = list_profiles()
-    if not profiles:
-        path = ensure_default_profile()
-        return path, load_profile(path)
+def choose_profile(repo: ProfileRepository,
+                   current: Optional[Profile]) -> Optional[Profile]:
+    names = repo.list_names()
+    if not names:
+        return repo.ensure_default()
 
     print(f"\n{BOLD}Выберите профиль:{RESET}")
-    for i, p in enumerate(profiles, 1):
-        marker = " ◀" if p == _current_profile_path else ""
-        print(f"  {CYAN}{i}{RESET}. {profile_name(p)}{marker}")
+    for i, n in enumerate(names, 1):
+        marker = " ◀" if current and n == current.name else ""
+        print(f"  {CYAN}{i}{RESET}. {n}{marker}")
     print(f"  {CYAN}+{RESET}. Создать новый")
     print(f"  {CYAN}n{RESET}. Без профиля")
     try:
         choice = input("Номер (Enter — оставить текущий): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        return _current_profile_path, _current_profile_text
+        return current
 
     if choice == "+":
-        return create_profile()
+        return create_profile(repo, current)
     if choice == "n":
-        return None, None
-    if choice.isdigit() and 1 <= int(choice) <= len(profiles):
-        path = profiles[int(choice) - 1]
-        text = load_profile(path)
-        print(f"{GREEN}Профиль: {profile_name(path)}{RESET}")
-        return path, text
-    return _current_profile_path, _current_profile_text
-
-# ── База знаний (долговременная) ──────────────────────────────────────────────
-def _knowledge_file(name: str) -> str:
-    return os.path.join(KNOWLEDGE_DIR, f"{name}.md")
-
-def save_knowledge(name: str, content: str):
-    os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
-    path = _knowledge_file(name)
-    with open(path, "w", encoding="utf-8") as f:
-        ts = time.strftime("%Y-%m-%d %H:%M")
-        f.write(f"<!-- сохранено: {ts} -->\n{content}")
-
-def load_all_knowledge() -> str:
-    if not os.path.isdir(KNOWLEDGE_DIR):
-        return ""
-    parts = []
-    for fname in sorted(os.listdir(KNOWLEDGE_DIR)):
-        if fname.endswith(".md"):
-            path = os.path.join(KNOWLEDGE_DIR, fname)
-            try:
-                with open(path, encoding="utf-8") as f:
-                    text = f.read().strip()
-                name = os.path.splitext(fname)[0]
-                parts.append(f"### {name}\n{text}")
-            except Exception:
-                pass
-    return "\n\n".join(parts)
-
-def list_knowledge() -> list:
-    if not os.path.isdir(KNOWLEDGE_DIR):
-        return []
-    return [f for f in sorted(os.listdir(KNOWLEDGE_DIR)) if f.endswith(".md")]
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        target = names[int(choice) - 1]
+        loaded = repo.load(target)
+        if loaded:
+            print(f"{GREEN}Профиль: {target}{RESET}")
+        return loaded
+    return current
 
 # ══════════════════════════════════════════════════════════════════════════════
 # СЛОЙ 2 — РАБОЧАЯ ПАМЯТЬ: контекст текущей задачи
@@ -408,19 +360,19 @@ def handle_wm(cmd_str: str, wm: WorkingMemory, wm_repo: FileWorkingMemoryReposit
 
 # ── База знаний: команды ──────────────────────────────────────────────────────
 
-def handle_know(cmd_str: str):
+def handle_know(cmd_str: str, repo: KnowledgeRepository):
     """/know save <имя> | /know list | /know show <имя>"""
     parts = cmd_str.split(None, 2)
     sub   = parts[1].lower() if len(parts) > 1 else "list"
 
     if sub == "list":
-        files = list_knowledge()
-        if not files:
+        names = repo.list_names()
+        if not names:
             print(f"{DIM}  База знаний пуста. Используй /know save <имя>{RESET}")
         else:
             print(f"\n{BOLD}{BLUE}База знаний:{RESET}")
-            for f in files:
-                print(f"    {BLUE}•{RESET} {os.path.splitext(f)[0]}")
+            for n in names:
+                print(f"    {BLUE}•{RESET} {n}")
             print()
 
     elif sub == "save":
@@ -444,7 +396,7 @@ def handle_know(cmd_str: str):
         except (EOFError, KeyboardInterrupt):
             pass
         if lines:
-            save_knowledge(name, "\n".join(lines))
+            repo.save(KnowledgeEntry(name=name, content="\n".join(lines)))
             print(f"{GREEN}  Сохранено в базу знаний: {name}{RESET}")
 
     elif sub == "show":
@@ -452,12 +404,11 @@ def handle_know(cmd_str: str):
         if not name:
             print(f"{YELLOW}  Использование: /know show <имя>{RESET}")
             return
-        path = _knowledge_file(name)
-        if not os.path.exists(path):
+        entry = repo.load(name)
+        if entry is None:
             print(f"{YELLOW}  Запись «{name}» не найдена.{RESET}")
         else:
-            with open(path, encoding="utf-8") as f:
-                print(f"\n{BOLD}{BLUE}{name}:{RESET}\n{f.read()}")
+            print(f"\n{BOLD}{BLUE}{entry.name}:{RESET}\n{entry.to_file_text()}")
 
     else:
         print(f"{YELLOW}  Подкоманды /know: list · save · show{RESET}")
@@ -626,6 +577,7 @@ def advance_task(task: Task,
                  wm: "WorkingMemory",
                  client: GigaChatClient,
                  task_repo: TaskRepository,
+                 knowledge_repo: KnowledgeRepository,
                  restoration_hint: bool = False) -> str:
     """Один прогон текущей стадии через модель.
 
@@ -670,7 +622,7 @@ def advance_task(task: Task,
     task.stages[task.state] = stage_obj
     task_repo.save(task)
 
-    base = build_system_prompt(profile_text, wm) or ""
+    base = build_system_prompt(profile_text, wm, knowledge_repo) or ""
     task_block = build_task_block(task, restoration_hint=restoration_hint)
     system_prompt = (base + "\n\n" + task_block) if base else task_block
 
@@ -880,10 +832,11 @@ def show_task(task: Task):
 
 def handle_task(cmd_str: str,
                 params: dict,
-                profile_text: Optional[str],
+                current_profile: Optional[Profile],
                 wm: "WorkingMemory",
                 client: GigaChatClient,
-                task_repo: TaskRepository) -> None:
+                task_repo: TaskRepository,
+                knowledge_repo: KnowledgeRepository) -> None:
     """Обработка /task <sub> ..."""
     parts = cmd_str.split(None, 2)
     sub = parts[1].lower() if len(parts) > 1 else "show"
@@ -909,15 +862,16 @@ def handle_task(cmd_str: str,
             task_repo.clear_active()
         task = Task.new(
             request,
-            profile=profile_name(_current_profile_path) if _current_profile_path else None,
+            profile=current_profile.name if current_profile else None,
             model=params["model"],
         )
         task_repo.save(task)
         task_repo.set_active(task)
         print(f"{GREEN}  Создана задача #{task.id} (стадия: {task.state}).{RESET}")
+        profile_text = current_profile.content if current_profile else None
         try:
             with Spinner("Думаю..."):
-                reply = advance_task(task, request, params, profile_text, wm, client, task_repo)
+                reply = advance_task(task, request, params, profile_text, wm, client, task_repo, knowledge_repo)
         except Exception as e:
             print(f"{YELLOW}  Ошибка стадии: {e}{RESET}")
             return
@@ -1074,7 +1028,9 @@ def handle_task(cmd_str: str,
 # ══════════════════════════════════════════════════════════════════════════════
 # Построение system prompt из всех слоёв памяти
 # ══════════════════════════════════════════════════════════════════════════════
-def build_system_prompt(profile_text: Optional[str], wm: WorkingMemory) -> Optional[str]:
+def build_system_prompt(profile_text: Optional[str],
+                        wm: WorkingMemory,
+                        knowledge_repo: KnowledgeRepository) -> Optional[str]:
     """
     Долговременная память (профиль + знания) + рабочая память → system prompt.
     Краткосрочная (messages) передаётся отдельно как история диалога.
@@ -1084,7 +1040,7 @@ def build_system_prompt(profile_text: Optional[str], wm: WorkingMemory) -> Optio
     if profile_text:
         parts.append(f"[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — Профиль]\n{profile_text}")
 
-    knowledge = load_all_knowledge()
+    knowledge = knowledge_repo.all_as_prompt()
     if knowledge:
         parts.append(f"[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — База знаний]\n{knowledge}")
 
@@ -1099,10 +1055,10 @@ def build_system_prompt(profile_text: Optional[str], wm: WorkingMemory) -> Optio
 # Экземпляр собирается в main() и прокидывается явным параметром.
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
-def print_settings(params: dict):
+def print_settings(params: dict, current_profile: Optional[Profile]):
     temp  = params["temperature"] if params["temperature"] is not None else "auto"
     maxt  = params["max_tokens"]  if params["max_tokens"]  is not None else "auto"
-    pname = profile_name(_current_profile_path) if _current_profile_path else "нет"
+    pname = current_profile.name if current_profile else "нет"
     print(f"{DIM}  модель: {params['model']}  temperature: {temp}  max_tokens: {maxt}  профиль: {pname}{RESET}")
 
 def _task_status_badge(task_repo: TaskRepository) -> str:
@@ -1122,7 +1078,11 @@ def _task_status_badge(task_repo: TaskRepository) -> str:
     return f"{YELLOW}задача: #{task.id} {task.state} · {short}{suffix}{RESET}"
 
 
-def print_memory_status(messages: list, wm: WorkingMemory, task_repo: TaskRepository):
+def print_memory_status(messages: list,
+                        wm: WorkingMemory,
+                        task_repo: TaskRepository,
+                        current_profile: Optional[Profile],
+                        knowledge_repo: KnowledgeRepository):
     """Однострочный дашборд всех слоёв памяти + активная задача."""
     # краткосрочная
     st_label = f"{GREEN}краткосрочная: {len(messages)} сообщ.{RESET}" if messages \
@@ -1130,11 +1090,11 @@ def print_memory_status(messages: list, wm: WorkingMemory, task_repo: TaskReposi
     # рабочая
     wm_label = wm_status_badge(wm)
     # долговременная
-    pname  = profile_name(_current_profile_path) if _current_profile_path else "нет"
-    kfiles = list_knowledge()
+    pname    = current_profile.name if current_profile else "нет"
+    k_count  = len(knowledge_repo.list_names())
     lt_label = f"{BLUE}долговременная: {pname}"
-    if kfiles:
-        lt_label += f", {len(kfiles)} знаний"
+    if k_count:
+        lt_label += f", {k_count} знаний"
     lt_label += RESET
     # задача
     task_label = _task_status_badge(task_repo)
@@ -1145,7 +1105,9 @@ def print_mem_detail(messages: list,
                      wm: WorkingMemory,
                      session_id: Optional[str],
                      session_repo: FileSessionRepository,
-                     task_repo: TaskRepository):
+                     task_repo: TaskRepository,
+                     current_profile: Optional[Profile],
+                     knowledge_repo: KnowledgeRepository):
     """Подробный вывод всех трёх слоёв."""
     print(f"\n{BOLD}═══ Модель памяти ═══{RESET}\n")
 
@@ -1167,13 +1129,13 @@ def print_mem_detail(messages: list,
 
     # Слой 3
     print(f"\n{BOLD}{BLUE}[3] Долговременная память{RESET}  {DIM}(профиль + знания){RESET}")
-    pname = profile_name(_current_profile_path) if _current_profile_path else "нет"
+    pname = current_profile.name if current_profile else "нет"
     print(f"    Профиль: {pname}")
-    kfiles = list_knowledge()
-    if kfiles:
-        print(f"    База знаний ({len(kfiles)} записей):")
-        for fname in kfiles:
-            print(f"      {BLUE}•{RESET} {os.path.splitext(fname)[0]}")
+    knames = knowledge_repo.list_names()
+    if knames:
+        print(f"    База знаний ({len(knames)} записей):")
+        for n in knames:
+            print(f"      {BLUE}•{RESET} {n}")
     else:
         print(f"    {DIM}База знаний пуста. Используй /know save{RESET}")
 
@@ -1280,13 +1242,13 @@ def main():
     messages: list = []
     current_session_id: Optional[str] = None
 
-    global _current_profile_path, _current_profile_text
-
     # Composition root: собираем инфраструктурные зависимости.
-    wm_repo      = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
-    session_repo = FileSessionRepository(HISTORY_DIR, MAX_SESSIONS)
-    task_repo    = FileTaskRepository(TASKS_DIR, ACTIVE_TASK_FILE)
-    client       = RequestsGigaChatClient(
+    wm_repo        = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
+    session_repo   = FileSessionRepository(HISTORY_DIR, MAX_SESSIONS)
+    task_repo      = FileTaskRepository(TASKS_DIR, ACTIVE_TASK_FILE)
+    profile_repo   = FileProfileRepository(PROFILES_DIR)
+    knowledge_repo = FileKnowledgeRepository(KNOWLEDGE_DIR)
+    client         = RequestsGigaChatClient(
         auth_key  = AUTH_KEY,
         oauth_url = OAUTH_URL,
         chat_url  = CHAT_URL,
@@ -1302,9 +1264,7 @@ def main():
         sys.exit(1)
 
     # Инициализация долговременной памяти
-    default_profile = ensure_default_profile()
-    _current_profile_path = default_profile
-    _current_profile_text = load_profile(default_profile)
+    current_profile: Optional[Profile] = profile_repo.ensure_default()
 
     # Инициализация рабочей памяти
     wm = wm_repo.load()
@@ -1356,8 +1316,8 @@ def main():
             task_repo.clear_active()
             print(f"{DIM}  Задача #{saved_active.id} оставлена в /task list (но не активна).{RESET}\n")
 
-    print_settings(params)
-    print_memory_status(messages, wm, task_repo)
+    print_settings(params, current_profile)
+    print_memory_status(messages, wm, task_repo, current_profile, knowledge_repo)
     print()
 
     while True:
@@ -1383,24 +1343,26 @@ def main():
             elif cmd == "/tokens":
                 set_max_tokens(params)
             elif cmd == "/settings":
-                print_settings(params)
-                print_memory_status(messages, wm, task_repo)
+                print_settings(params, current_profile)
+                print_memory_status(messages, wm, task_repo, current_profile, knowledge_repo)
             elif cmd == "/mem":
-                print_mem_detail(messages, wm, current_session_id, session_repo, task_repo)
+                print_mem_detail(messages, wm, current_session_id, session_repo,
+                                 task_repo, current_profile, knowledge_repo)
             elif cmd.startswith("/wm"):
                 handle_wm(user_input, wm, wm_repo)
             elif cmd.startswith("/know"):
-                handle_know(user_input)
+                handle_know(user_input, knowledge_repo)
             elif cmd.startswith("/task"):
-                handle_task(user_input, params, _current_profile_text, wm, client, task_repo)
+                handle_task(user_input, params, current_profile, wm,
+                            client, task_repo, knowledge_repo)
             elif cmd == "/profile new":
-                _current_profile_path, _current_profile_text = create_profile()
+                current_profile = create_profile(profile_repo, current_profile)
             elif cmd == "/profile edit":
-                _current_profile_path, _current_profile_text = edit_profile()
+                current_profile = edit_profile(profile_repo, current_profile)
             elif cmd == "/profile delete":
-                _current_profile_path, _current_profile_text = delete_profile()
+                current_profile = delete_profile(profile_repo, current_profile)
             elif cmd == "/profile":
-                _current_profile_path, _current_profile_text = choose_profile()
+                current_profile = choose_profile(profile_repo, current_profile)
             elif cmd == "/clear":
                 if current_session_id:
                     session_repo.delete(current_session_id)
@@ -1435,7 +1397,8 @@ def main():
                 try:
                     with Spinner("Думаю..."):
                         reply = advance_task(active_task, "", params,
-                                             _current_profile_text, wm, client, task_repo,
+                                             current_profile.content if current_profile else None,
+                                             wm, client, task_repo, knowledge_repo,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -1457,7 +1420,8 @@ def main():
                 try:
                     with Spinner("Перепланирую..."):
                         reply = advance_task(active_task, "", params,
-                                             _current_profile_text, wm, client, task_repo,
+                                             current_profile.content if current_profile else None,
+                                             wm, client, task_repo, knowledge_repo,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -1472,7 +1436,8 @@ def main():
             try:
                 with Spinner("Думаю..."):
                     reply = advance_task(active_task, user_input, params,
-                                         _current_profile_text, wm, client, task_repo,
+                                         current_profile.content if current_profile else None,
+                                         wm, client, task_repo, knowledge_repo,
                                          restoration_hint=pending_restoration_hint)
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
@@ -1501,7 +1466,11 @@ def main():
         messages.append({"role": "user", "content": user_input})
 
         # Формируем system prompt из долговременной + рабочей памяти
-        system_prompt = build_system_prompt(_current_profile_text, wm)
+        system_prompt = build_system_prompt(
+            current_profile.content if current_profile else None,
+            wm,
+            knowledge_repo,
+        )
 
         try:
             with Spinner("Думаю..."):
