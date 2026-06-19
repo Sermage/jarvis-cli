@@ -11,6 +11,21 @@ from typing import Optional
 import requests
 import urllib3
 
+from domain.task import (
+    TaskState,
+    TaskTransitionError,
+    StageStatus,
+    StageResult,
+    Task as _DomainTask,
+)
+from domain.working_memory import WorkingMemory as _DomainWorkingMemory
+from domain.profile import (
+    DEFAULT_PROFILE_CONTENT,
+    PROFILE_TEMPLATE,
+    sanitize_profile_name,
+)
+from domain.knowledge import sanitize_knowledge_name
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -53,26 +68,6 @@ KNOWLEDGE_DIR = os.path.expanduser("~/.jarvis/knowledge")
 TASKS_DIR    = os.path.expanduser("~/.jarvis/tasks")
 ACTIVE_TASK_FILE = os.path.join(TASKS_DIR, "active")
 MAX_SESSIONS = 20
-
-DEFAULT_PROFILE_CONTENT = """\
-# Профиль агента
-
-Ты — Jarvis, интеллектуальный ассистент-разработчик.
-
-## Роль
-Помогаешь с разработкой программного обеспечения: пишешь и объясняешь код,
-находишь баги, предлагаешь архитектурные решения.
-
-## Правила
-- Отвечай на русском языке, если пользователь пишет по-русски
-- Давай краткие и точные ответы
-- Предпочитай конкретные примеры кода абстрактным объяснениям
-- Если вопрос неоднозначен — уточни, прежде чем отвечать
-
-## Ограничения
-- Не придумывай факты — лучше скажи, что не знаешь
-- Не генерируй вредоносный или небезопасный код
-"""
 
 # ── ANSI colors ───────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -142,20 +137,6 @@ def ensure_default_profile() -> str:
 def profile_name(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
-PROFILE_TEMPLATE = """\
-# {name}
-
-## Роль
-Опиши роль и личность агента.
-
-## Правила
-- Правило 1
-- Правило 2
-
-## Ограничения
-- Ограничение 1
-"""
-
 def open_in_editor(path: str):
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
     subprocess.call([editor, path])
@@ -170,7 +151,7 @@ def create_profile() -> tuple:
         print(f"{YELLOW}Название не может быть пустым.{RESET}")
         return _current_profile_path, _current_profile_text
 
-    safe_name = name.replace(" ", "-").replace("/", "-")
+    safe_name = sanitize_profile_name(name)
     path = os.path.join(PROFILES_DIR, f"{safe_name}.md")
 
     if os.path.exists(path):
@@ -316,17 +297,13 @@ def list_knowledge() -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 # СЛОЙ 2 — РАБОЧАЯ ПАМЯТЬ: контекст текущей задачи
 # ══════════════════════════════════════════════════════════════════════════════
-class WorkingMemory:
-    """Рабочая память: задача, контекст, заметки для текущего сеанса работы."""
+class WorkingMemory(_DomainWorkingMemory):
+    """Рабочая память + файловая персистентность и ANSI-вывод.
+
+    Чистая модель данных и сборка system-prompt-блока — в `domain.working_memory`.
+    """
 
     _FILE = os.path.join(WORKING_DIR, "current.json")
-
-    def __init__(self):
-        self.task: Optional[str] = None
-        self.context: dict       = {}
-        self.notes: list         = []
-        self.created_at: Optional[str] = None
-        self.updated_at: Optional[str] = None
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -351,13 +328,7 @@ class WorkingMemory:
             self.created_at = now
         self.updated_at = now
         with open(self._FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "task":       self.task,
-                "context":    self.context,
-                "notes":      self.notes,
-                "created_at": self.created_at,
-                "updated_at": self.updated_at,
-            }, f, ensure_ascii=False, indent=2)
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
 
     def clear(self):
         self.task = self.created_at = self.updated_at = None
@@ -366,27 +337,7 @@ class WorkingMemory:
         if os.path.exists(self._FILE):
             os.remove(self._FILE)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    def is_empty(self) -> bool:
-        return not self.task and not self.context and not self.notes
-
-    def to_prompt(self) -> str:
-        """Формирует блок для system prompt."""
-        if self.is_empty():
-            return ""
-        lines = ["[РАБОЧАЯ ПАМЯТЬ]"]
-        if self.task:
-            lines.append(f"Текущая задача: {self.task}")
-        if self.context:
-            lines.append("Контекст:")
-            for k, v in self.context.items():
-                lines.append(f"  {k}: {v}")
-        if self.notes:
-            lines.append("Заметки:")
-            for note in self.notes:
-                lines.append(f"  • {note}")
-        return "\n".join(lines)
+    # ── UI ───────────────────────────────────────────────────────────────────
 
     def show(self):
         if self.is_empty():
@@ -499,10 +450,10 @@ def handle_know(cmd_str: str):
             print()
 
     elif sub == "save":
-        name = parts[2].strip().replace(" ", "-") if len(parts) > 2 else ""
+        name = sanitize_knowledge_name(parts[2]) if len(parts) > 2 else ""
         if not name:
             try:
-                name = input("  Имя записи: ").strip().replace(" ", "-")
+                name = sanitize_knowledge_name(input("  Имя записи: "))
             except (EOFError, KeyboardInterrupt):
                 return
         if not name:
@@ -608,211 +559,18 @@ def clear_session(messages: list):
     _current_session_file = None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# СЛОЙ 4 — МАШИНА СОСТОЯНИЙ ЗАДАЧИ: структура данных и персистентность
+# СЛОЙ 4 — МАШИНА СОСТОЯНИЙ ЗАДАЧИ: персистентность поверх domain.Task
 # ══════════════════════════════════════════════════════════════════════════════
-class TaskState:
-    INTAKE     = "intake"
-    PLANNING   = "planning"
-    EXECUTION  = "execution"
-    VALIDATION = "validation"
-    DONE       = "done"
-    ABORTED    = "aborted"
-
-    ALL = [INTAKE, PLANNING, EXECUTION, VALIDATION, DONE, ABORTED]
-    TERMINAL = {DONE, ABORTED}
-
-
-# Разрешённые переходы. Откат validation → planning умышленно запрещён:
-# если на этапе валидации выяснилось, что план плох, сначала идём в execution,
-# а оттуда уже в planning. Это сохраняет инвариант «после planning всегда
-# был хотя бы один заход в execution».
-_ALLOWED_TRANSITIONS = {
-    TaskState.INTAKE     : {TaskState.PLANNING,  TaskState.ABORTED},
-    TaskState.PLANNING   : {TaskState.EXECUTION, TaskState.INTAKE,    TaskState.ABORTED},
-    TaskState.EXECUTION  : {TaskState.VALIDATION, TaskState.PLANNING, TaskState.ABORTED},
-    TaskState.VALIDATION : {TaskState.EXECUTION, TaskState.DONE,      TaskState.ABORTED},
-    TaskState.DONE       : set(),
-    TaskState.ABORTED    : set(),
-}
-
-
-class TaskTransitionError(Exception):
-    pass
-
-
-class StageStatus:
-    PENDING       = "pending"
-    IN_PROGRESS   = "in_progress"
-    AWAITING_USER = "awaiting_user"
-    DONE          = "done"
-    FAILED        = "failed"
-
-
-class StageResult:
-    """Результат одной стадии задачи."""
-
-    def __init__(self,
-                 status: str = StageStatus.PENDING,
-                 output: str = "",
-                 artifacts: Optional[dict] = None,
-                 started_at: Optional[str] = None,
-                 finished_at: Optional[str] = None):
-        self.status      = status
-        self.output      = output
-        self.artifacts   = artifacts if artifacts is not None else {}
-        self.started_at  = started_at
-        self.finished_at = finished_at
-
-    def to_dict(self) -> dict:
-        return {
-            "status":      self.status,
-            "output":      self.output,
-            "artifacts":   self.artifacts,
-            "started_at":  self.started_at,
-            "finished_at": self.finished_at,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "StageResult":
-        return cls(
-            status      = d.get("status", StageStatus.PENDING),
-            output      = d.get("output", ""),
-            artifacts   = d.get("artifacts") or {},
-            started_at  = d.get("started_at"),
-            finished_at = d.get("finished_at"),
-        )
-
-
-class Task:
-    """Задача с явной машиной состояний и персистентностью.
-
-    Шаг 1: только структура данных + сериализация. Логика переходов,
-    драйвер стадий, парсинг вопросов и UI добавляются на следующих шагах.
-    """
-
-    def __init__(self,
-                 id: str,
-                 title: str,
-                 request: str,
-                 state: str = TaskState.INTAKE,
-                 stages: Optional[dict] = None,
-                 context: Optional[dict] = None,
-                 pending_questions: Optional[list] = None,
-                 answers: Optional[list] = None,
-                 awaiting: Optional[str] = None,
-                 profile_snapshot: Optional[str] = None,
-                 model_snapshot: Optional[str] = None,
-                 created_at: Optional[str] = None,
-                 updated_at: Optional[str] = None,
-                 transitions: Optional[list] = None):
-        self.id                = id
-        self.title             = title
-        self.request           = request
-        self.state             = state
-        self.stages            = stages if stages is not None else {}
-        self.context           = context if context is not None else {}
-        self.pending_questions = pending_questions if pending_questions is not None else []
-        self.answers           = answers if answers is not None else []
-        self.awaiting          = awaiting
-        self.profile_snapshot  = profile_snapshot
-        self.model_snapshot    = model_snapshot
-        self.created_at        = created_at
-        self.updated_at        = updated_at
-        self.transitions       = transitions if transitions is not None else []
-
-    # ── factory ──────────────────────────────────────────────────────────────
-
-    @classmethod
-    def new(cls,
-            request: str,
-            profile: Optional[str] = None,
-            model: Optional[str] = None) -> "Task":
-        now   = time.strftime("%Y-%m-%d %H:%M")
-        title = request.strip().split("\n", 1)[0][:60] or "—"
-        return cls(
-            id               = uuid.uuid4().hex[:8],
-            title            = title,
-            request          = request,
-            state            = TaskState.INTAKE,
-            profile_snapshot = profile,
-            model_snapshot   = model,
-            created_at       = now,
-            updated_at       = now,
-        )
-
-    # ── state machine ────────────────────────────────────────────────────────
-
-    def can_transition(self, new_state: str) -> bool:
-        return new_state in _ALLOWED_TRANSITIONS.get(self.state, set())
+# Чистая модель (данные, переходы, сериализация) живёт в domain.task.
+# Здесь — файловое хранилище и указатель активной задачи. По мере роста
+# слоя infra/ эти методы переедут в TaskRepository.
+class Task(_DomainTask):
+    """Задача с файловой персистентностью поверх доменной модели."""
 
     def transition(self, new_state: str, reason: str = "", save: bool = True):
-        """Перевести задачу в новое состояние.
-
-        Запись в `transitions` идёт всегда, save() вызывается по умолчанию,
-        чтобы переживать падения между шагами. Передай save=False, если
-        хочешь сгруппировать несколько изменений и сохранить один раз.
-        """
-        if new_state not in TaskState.ALL:
-            raise TaskTransitionError(f"Неизвестное состояние: {new_state!r}")
-        if not self.can_transition(new_state):
-            allowed = sorted(_ALLOWED_TRANSITIONS.get(self.state, set()))
-            raise TaskTransitionError(
-                f"Запрещённый переход: {self.state} → {new_state}. "
-                f"Разрешено из {self.state}: {allowed or 'ничего (терминальное состояние)'}"
-            )
-        self.transitions.append({
-            "from":   self.state,
-            "to":     new_state,
-            "at":     time.strftime("%Y-%m-%d %H:%M:%S"),
-            "reason": reason,
-        })
-        self.state = new_state
+        super().transition(new_state, reason=reason)
         if save:
             self.save()
-
-    def is_terminal(self) -> bool:
-        return self.state in TaskState.TERMINAL
-
-    # ── serialization ────────────────────────────────────────────────────────
-
-    def to_dict(self) -> dict:
-        return {
-            "id":                self.id,
-            "title":             self.title,
-            "request":           self.request,
-            "state":             self.state,
-            "stages":            {k: v.to_dict() for k, v in self.stages.items()},
-            "context":           self.context,
-            "pending_questions": self.pending_questions,
-            "answers":           self.answers,
-            "awaiting":          self.awaiting,
-            "profile_snapshot":  self.profile_snapshot,
-            "model_snapshot":    self.model_snapshot,
-            "created_at":        self.created_at,
-            "updated_at":        self.updated_at,
-            "transitions":       self.transitions,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Task":
-        raw_stages = d.get("stages") or {}
-        stages = {k: StageResult.from_dict(v) for k, v in raw_stages.items()}
-        return cls(
-            id                = d["id"],
-            title             = d.get("title", "—"),
-            request           = d.get("request", ""),
-            state             = d.get("state", TaskState.INTAKE),
-            stages            = stages,
-            context           = d.get("context") or {},
-            pending_questions = d.get("pending_questions") or [],
-            answers           = d.get("answers") or [],
-            awaiting          = d.get("awaiting"),
-            profile_snapshot  = d.get("profile_snapshot"),
-            model_snapshot    = d.get("model_snapshot"),
-            created_at        = d.get("created_at"),
-            updated_at        = d.get("updated_at"),
-            transitions       = d.get("transitions") or [],
-        )
 
     # ── persistence ──────────────────────────────────────────────────────────
 
