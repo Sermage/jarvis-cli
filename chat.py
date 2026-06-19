@@ -26,6 +26,7 @@ from domain.profile import (
 )
 from domain.knowledge import sanitize_knowledge_name
 from infra.working_memory_repository import FileWorkingMemoryRepository
+from infra.session_repository import FileSessionRepository
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -462,71 +463,8 @@ def handle_know(cmd_str: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # СЛОЙ 1 — КРАТКОСРОЧНАЯ ПАМЯТЬ: диалог текущей сессии
 # ══════════════════════════════════════════════════════════════════════════════
-_current_session_file = None
-
-def _session_path() -> str:
-    ts = time.strftime("%Y-%m-%dT%H-%M-%S")
-    return os.path.join(HISTORY_DIR, f"{ts}.json")
-
-def save_session(messages: list, params: dict):
-    global _current_session_file
-    os.makedirs(HISTORY_DIR, exist_ok=True)
-    if _current_session_file is None:
-        _current_session_file = _session_path()
-    title = messages[0]["content"][:60].replace("\n", " ") if messages else ""
-    data = {
-        "title":      title,
-        "model":      params["model"],
-        "updated_at": time.strftime("%Y-%m-%d %H:%M"),
-        "params":     params,
-        "messages":   messages,
-    }
-    with open(_current_session_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    _prune_sessions()
-
-def _prune_sessions():
-    files = sorted(_list_session_files())
-    for f in files[:-MAX_SESSIONS]:
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-
-def _list_session_files() -> list:
-    if not os.path.isdir(HISTORY_DIR):
-        return []
-    return [
-        os.path.join(HISTORY_DIR, f)
-        for f in os.listdir(HISTORY_DIR)
-        if f.endswith(".json")
-    ]
-
-def list_sessions() -> list:
-    sessions = []
-    for path in sorted(_list_session_files(), reverse=True):
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            sessions.append({
-                "path":       path,
-                "title":      data.get("title", "—"),
-                "model":      data.get("model", "?"),
-                "updated_at": data.get("updated_at", ""),
-                "count":      len(data.get("messages", [])),
-                "params":     data.get("params", {}),
-                "messages":   data.get("messages", []),
-            })
-        except Exception:
-            pass
-    return sessions
-
-def clear_session(messages: list):
-    global _current_session_file
-    messages.clear()
-    if _current_session_file and os.path.exists(_current_session_file):
-        os.remove(_current_session_file)
-    _current_session_file = None
+# Хранилище и ротация — в infra.session_repository.FileSessionRepository.
+# Идентификатор активной сессии живёт как локальная переменная в main().
 
 # ══════════════════════════════════════════════════════════════════════════════
 # СЛОЙ 4 — МАШИНА СОСТОЯНИЙ ЗАДАЧИ: персистентность поверх domain.Task
@@ -1320,7 +1258,10 @@ def print_memory_status(messages: list, wm: WorkingMemory):
 
     print(f"  {st_label}  │  {wm_label}  │  {lt_label}  │  {task_label}")
 
-def print_mem_detail(messages: list, wm: WorkingMemory):
+def print_mem_detail(messages: list,
+                     wm: WorkingMemory,
+                     session_id: Optional[str],
+                     session_repo: FileSessionRepository):
     """Подробный вывод всех трёх слоёв."""
     print(f"\n{BOLD}═══ Модель памяти ═══{RESET}\n")
 
@@ -1328,11 +1269,11 @@ def print_mem_detail(messages: list, wm: WorkingMemory):
     print(f"{BOLD}{GREEN}[1] Краткосрочная память{RESET}  {DIM}(текущий диалог){RESET}")
     if messages:
         print(f"    {len(messages)} сообщений в текущей сессии")
-        if _current_session_file:
-            print(f"    {DIM}файл: {_current_session_file}{RESET}")
+        if session_id:
+            print(f"    {DIM}файл: {session_repo.path_for(session_id)}{RESET}")
     else:
         print(f"    {DIM}пусто (новая сессия){RESET}")
-    total = len(_list_session_files())
+    total = len(session_repo.list_all())
     if total:
         print(f"    {DIM}всего сохранённых сессий: {total}{RESET}")
 
@@ -1453,10 +1394,13 @@ def print_help():
 def main():
     params   = dict(DEFAULT_PARAMS)
     messages: list = []
+    current_session_id: Optional[str] = None
 
-    global _current_session_file, _current_profile_path, _current_profile_text
+    global _current_profile_path, _current_profile_text
 
-    wm_repo = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
+    # Composition root: собираем инфраструктурные зависимости.
+    wm_repo      = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
+    session_repo = FileSessionRepository(HISTORY_DIR, MAX_SESSIONS)
 
     print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}\n")
 
@@ -1479,7 +1423,7 @@ def main():
         print()
 
     # Выбор краткосрочной памяти (сессии)
-    sessions = list_sessions()
+    sessions = session_repo.list_all()
     if sessions:
         print(f"{BOLD}Выберите сессию:{RESET}")
         for i, s in enumerate(sessions[:9], 1):
@@ -1495,7 +1439,7 @@ def main():
             s = sessions[int(choice) - 1]
             messages = s["messages"]
             params.update(s["params"])
-            _current_session_file = s["path"]
+            current_session_id = s["id"]
             print(f"{DIM}Загружено {len(messages)} сообщений.{RESET}\n")
 
     # Восстановление активной задачи (Слой 4): спрашиваем пользователя, продолжать ли.
@@ -1551,7 +1495,7 @@ def main():
                 print_settings(params)
                 print_memory_status(messages, wm)
             elif cmd == "/mem":
-                print_mem_detail(messages, wm)
+                print_mem_detail(messages, wm, current_session_id, session_repo)
             elif cmd.startswith("/wm"):
                 handle_wm(user_input, wm, wm_repo)
             elif cmd.startswith("/know"):
@@ -1567,7 +1511,10 @@ def main():
             elif cmd == "/profile":
                 _current_profile_path, _current_profile_text = choose_profile()
             elif cmd == "/clear":
-                clear_session(messages)
+                if current_session_id:
+                    session_repo.delete(current_session_id)
+                    current_session_id = None
+                messages.clear()
                 print(f"{DIM}Краткосрочная память очищена (диалог).{RESET}")
             elif cmd == "/help":
                 print_help()
@@ -1694,7 +1641,7 @@ def main():
 
         # Краткосрочная память: сохраняем ответ ассистента
         messages.append({"role": "assistant", "content": reply})
-        save_session(messages, params)
+        current_session_id = session_repo.save(current_session_id, messages, params)
         print()
 
 if __name__ == "__main__":
