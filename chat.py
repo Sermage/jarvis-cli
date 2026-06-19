@@ -39,6 +39,22 @@ from app.ports import (
 )
 from domain.profile import Profile
 from domain.knowledge import KnowledgeEntry
+from app.parsers import parse_questions, parse_validation_verdict
+from app.stage_prompts import (
+    STAGE_PROMPTS,
+    STAGE_ORDER,
+    build_task_block,
+    next_forward_state,
+)
+from app.system_prompt import build_system_prompt
+from app.task_driver import (
+    PLAN_APPROVAL_APPROVED,
+    PLAN_APPROVAL_REJECTED,
+    PLAN_APPROVAL_RETRY,
+    advance_task,
+    handle_plan_approval,
+    handle_plan_revision,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -429,340 +445,14 @@ def handle_know(cmd_str: str, repo: KnowledgeRepository):
 Task = _DomainTask  # переходный алиас: убрать при переезде вызовов
 
 
-# ── Stage prompts + driver ────────────────────────────────────────────────────
-QUESTION_PROTOCOL = (
-    "ПРАВИЛО УТОЧНЕНИЙ: если на любом этапе тебе не хватает данных, чтобы продолжать "
-    "уверенно — задай уточняющий вопрос пользователю. Каждый такой вопрос ОБЯЗАТЕЛЬНО "
-    "оформи отдельной строкой ровно в формате:\n"
-    "[QUESTION] <текст вопроса>\n"
-    "Можно несколько подряд. Если вопросов нет — НЕ используй этот тег вовсе."
-)
-
-STAGE_PROMPTS = {
-    TaskState.INTAKE: (
-        "Сейчас стадия INTAKE — сбор и уточнение задачи.\n"
-        "Цель: за ОДИН раунд убедиться, что задача понятна для планирования. Не более.\n"
-        "Если в разделе «Уточнения от пользователя» выше уже есть ответы — считай задачу понятной "
-        "и НЕ задавай новых вопросов: переходи к итоговой формулировке.\n"
-        "Если ответов пользователя ещё нет и в исходном запросе есть КРИТИЧНЫЕ неясности, без которых "
-        "нельзя составить план — задай 1–3 самых важных уточняющих вопроса (см. ПРАВИЛО УТОЧНЕНИЙ). "
-        "Не задавай вопросов о деталях, которые можно решить разумным дефолтом позже на стадии планирования.\n"
-        "Когда готов: сформулируй задачу одним абзацем и заверши ответ — НЕ используй [QUESTION]."
-    ),
-    TaskState.PLANNING: (
-        "Сейчас стадия PLANNING — составление плана.\n"
-        "На основе уточнённой задачи составь подробный пошаговый план: пронумерованные пункты, "
-        "у каждого — что именно будет сделано и какой ожидаемый результат.\n"
-        "Если для составления плана не хватает данных — сначала задай уточняющие вопросы "
-        "(см. ПРАВИЛО УТОЧНЕНИЙ) и НЕ выводи план в этом ответе.\n"
-        "Когда план готов — в самом конце ответа ОБЯЗАТЕЛЬНО спроси дословно: «Утвердить план? [y/n]»"
-    ),
-    TaskState.EXECUTION: (
-        "Сейчас стадия EXECUTION — выполнение утверждённого плана.\n"
-        "Выполняй пункты плана по порядку. По каждому пункту опиши, что сделано и какой получился результат.\n"
-        "Если по ходу выяснилось, что план неверен — явно скажи об этом, не продолжай вслепую.\n"
-        "Если нужны данные от пользователя — задай уточняющий вопрос (см. ПРАВИЛО УТОЧНЕНИЙ)."
-    ),
-    TaskState.VALIDATION: (
-        "Сейчас стадия VALIDATION — проверка результата.\n"
-        "Сверь сделанное с утверждённым планом и исходным запросом.\n"
-        "Перечисли найденные проблемы конкретными пунктами; если проблем нет — скажи прямо, что всё в порядке.\n"
-        "Если для проверки не хватает данных — задай уточняющий вопрос (см. ПРАВИЛО УТОЧНЕНИЙ).\n"
-        "\n"
-        "Заверши ответ ОДНОЙ из меток ровно на отдельной строке:\n"
-        "  [VALIDATION OK]     — если проблем не найдено и задачу можно завершать;\n"
-        "  [VALIDATION ISSUES] — если есть проблемы (они перечислены выше, нужно вернуться к выполнению).\n"
-        "Без [QUESTION] и без обеих меток сразу. Если есть незакрытые [QUESTION] — метку НЕ ставь."
-    ),
-}
-
-# Маркер вопроса: строка, начинающаяся с [QUESTION]. Захватываем всё до следующего
-# тега-в-начале-строки (любой [XXX] из заглавных букв/пробелов) или до конца текста,
-# поддерживая многострочные формулировки. Тег-разделитель шире, чем сам [QUESTION],
-# чтобы корректно отделять вопросы от меток вердикта вроде [VALIDATION OK].
-_QUESTION_RE = re.compile(
-    r"^\s*\[QUESTION\]\s*(.+?)(?=^\s*\[[A-Z][A-Z _]*\]|\Z)",
-    re.MULTILINE | re.DOTALL)
-
-
-def parse_questions(text: str) -> list:
-    """Извлекает вопросы агента из ответа модели."""
-    return [m.strip() for m in _QUESTION_RE.findall(text) if m.strip()]
-
-
-# Метки вердикта стадии validation. Якорим на начало строки, чтобы случайные
-# упоминания «[VALIDATION OK]» внутри прозы не триггерили автопереход.
-_VALIDATION_OK_RE = re.compile(
-    r"^\s*\[VALIDATION\s+OK\]\s*$", re.MULTILINE | re.IGNORECASE)
-_VALIDATION_ISSUES_RE = re.compile(
-    r"^\s*\[VALIDATION\s+(?:ISSUES|FAILED|FAIL|NOK)\]\s*$",
-    re.MULTILINE | re.IGNORECASE)
-
-
-def parse_validation_verdict(text: str) -> Optional[str]:
-    """Возвращает 'ok', 'issues' или None (вердикт не задан).
-
-    Если в ответе одновременно есть обе метки — приоритет у issues
-    (безопаснее: лучше пройти ещё один круг execution, чем закрыть с проблемами).
-    """
-    has_issues = bool(_VALIDATION_ISSUES_RE.search(text))
-    has_ok     = bool(_VALIDATION_OK_RE.search(text))
-    if has_issues:
-        return "issues"
-    if has_ok:
-        return "ok"
-    return None
-
-# Порядок стадий «вперёд» — нужен для построения контекста и команды /task advance.
-_STAGE_ORDER = [
-    TaskState.INTAKE,
-    TaskState.PLANNING,
-    TaskState.EXECUTION,
-    TaskState.VALIDATION,
-    TaskState.DONE,
-]
-
-
-def build_task_block(task: Task, restoration_hint: bool = False) -> str:
-    """Блок [ЗАДАЧА] для system prompt: контекст, прошлые стадии, инструкция для текущей.
-
-    Если restoration_hint=True — добавляется блок «возобновление после перерыва»,
-    просящий модель кратко напомнить пользователю, на чём остановились.
-    """
-    lines = [f"[ЗАДАЧА #{task.id}: {task.title}]"]
-    lines.append(f"Исходный запрос пользователя: {task.request}")
-    lines.append(f"Текущая стадия: {task.state}")
-
-    if task.context:
-        lines.append("Контекст задачи:")
-        for k, v in task.context.items():
-            lines.append(f"  {k}: {v}")
-
-    # результаты прошлых стадий (всё, что строго до текущей)
-    for s in _STAGE_ORDER:
-        if s == task.state:
-            break
-        result = task.stages.get(s)
-        if result and result.output:
-            lines.append(f"\n--- Результат стадии {s} ---\n{result.output}")
-
-    if task.answers:
-        lines.append("\n--- Уточнения от пользователя ---")
-        for a in task.answers:
-            lines.append(f"Q: {a.get('q','')}\nA: {a.get('a','')}")
-
-    instr = STAGE_PROMPTS.get(task.state)
-    if instr:
-        lines.append(f"\n--- Инструкция для текущей стадии ({task.state}) ---\n{instr}")
-
-    lines.append(f"\n--- Протокол уточнений ---\n{QUESTION_PROTOCOL}")
-
-    if restoration_hint:
-        lines.append(
-            "\n--- Возобновление после перерыва ---\n"
-            "Работа над этой задачей была прервана (закрыт чат / истекло время / "
-            "пропала связь) и сейчас возобновлена. Прежде чем продолжать стадию, "
-            "начни ответ с краткого (1–2 предложения) напоминания, на чём именно "
-            "остановились — чтобы пользователь быстро восстановил контекст. "
-            "Потом продолжай как обычно."
-        )
-
-    return "\n".join(lines)
-
-
-def advance_task(task: Task,
-                 user_input: str,
-                 params: dict,
-                 profile_text: Optional[str],
-                 wm: "WorkingMemory",
-                 client: GigaChatClient,
-                 task_repo: TaskRepository,
-                 knowledge_repo: KnowledgeRepository,
-                 restoration_hint: bool = False) -> str:
-    """Один прогон текущей стадии через модель.
-
-    Если у задачи есть незакрытые вопросы (pending_questions), user_input
-    трактуется как ответ на них: пишется в task.answers, очищается список
-    вопросов, и только после этого зовётся модель. Если модель в новом ответе
-    задаёт новые [QUESTION] — стадия остаётся awaiting_user; иначе — done.
-    """
-    if task.is_terminal():
-        raise RuntimeError(f"Задача в терминальном состоянии: {task.state}")
-    if task.state not in STAGE_PROMPTS:
-        raise RuntimeError(f"Для стадии {task.state} нет промпта")
-
-    # Если уже ждём чего-то отличного от уточнения (например, plan_approval) —
-    # на это есть отдельный обработчик; этот код такой ввод не трогает.
-    if task.awaiting and task.awaiting != "clarification":
-        raise RuntimeError(f"Задача ожидает {task.awaiting}, а не свободного ответа")
-
-    # 1) Если ждали ответа на уточнения — фиксируем его в answers.
-    if task.pending_questions and user_input:
-        task.answers.append({
-            "kind":  "clarification",
-            "stage": task.state,
-            "q":     "\n".join(task.pending_questions),
-            "a":     user_input,
-            "at":    time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-        task.pending_questions = []
-        task.awaiting = None
-        task_repo.save(task)
-        # user_input уже впитан в answers и попадёт в task_block — не дублируем
-        # его как отдельное user-message, чтобы модель не отвечала на ответ как
-        # на новый вопрос.
-        followup_message = ""
-    else:
-        followup_message = user_input
-
-    stage_obj = task.stages.get(task.state) or StageResult()
-    if stage_obj.started_at is None:
-        stage_obj.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    stage_obj.status = StageStatus.IN_PROGRESS
-    task.stages[task.state] = stage_obj
-    task_repo.save(task)
-
-    base = build_system_prompt(profile_text, wm, knowledge_repo) or ""
-    task_block = build_task_block(task, restoration_hint=restoration_hint)
-    system_prompt = (base + "\n\n" + task_block) if base else task_block
-
-    stage_messages = []
-    if followup_message:
-        stage_messages.append({"role": "user", "content": followup_message})
-
-    try:
-        reply = client.chat(stage_messages, params, system_prompt)
-    except Exception:
-        stage_obj.status = StageStatus.FAILED
-        task_repo.save(task)
-        raise
-
-    # Накапливаем вывод стадии (важно при многошаговых итерациях).
-    stage_obj.output = (stage_obj.output + "\n\n" + reply).strip() if stage_obj.output else reply
-
-    # Разбираем reply: если в нём есть [QUESTION] — ставим awaiting_user.
-    questions = parse_questions(reply)
-    if questions:
-        task.pending_questions = questions
-        task.awaiting = "clarification"
-        stage_obj.status = StageStatus.AWAITING_USER
-        task.stages[task.state] = stage_obj
-        task_repo.save(task)
-        return reply
-
-    if task.state == TaskState.PLANNING:
-        # План готов — стадия не закрывается, ждём явного y/n от пользователя.
-        # finished_at выставится позже, в handle_plan_approval после "y".
-        task.pending_questions = []
-        task.awaiting = "plan_approval"
-        stage_obj.status = StageStatus.AWAITING_USER
-        task.stages[task.state] = stage_obj
-        task_repo.save(task)
-        return reply
-
-    # Стадия отработала без вопросов — закрываем её.
-    task.pending_questions = []
-    task.awaiting = None
-    stage_obj.status = StageStatus.DONE
-    stage_obj.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    task.stages[task.state] = stage_obj
-    task_repo.save(task)
-
-    # Стадия intake: ответ без [QUESTION] означает, что модель готова планировать.
-    # Без автоперехода задача залипает в intake и следующее сообщение пользователя
-    # снова запускает intake-промпт, который снова просит уточнений — отсюда петля
-    # и повторы одних и тех же вопросов.
-    if task.state == TaskState.INTAKE:
-        task_repo.transition(task, TaskState.PLANNING, reason="уточнения собраны, переходим к плану")
-
-    # Стадия validation: автоматический переход по вердикту модели.
-    if task.state == TaskState.VALIDATION:
-        verdict = parse_validation_verdict(reply)
-        if verdict == "ok":
-            task_repo.transition(task, TaskState.DONE, reason="валидация пройдена")
-        elif verdict == "issues":
-            task_repo.transition(task, TaskState.EXECUTION, reason="валидация выявила проблемы")
-        # verdict == None — оставляем validation done, пользователь решит руками.
-
-    return reply
-
-
-def _next_forward_state(state: str) -> Optional[str]:
-    """Следующая стадия по линейному порядку (для /task advance)."""
-    try:
-        i = _STAGE_ORDER.index(state)
-    except ValueError:
-        return None
-    return _STAGE_ORDER[i + 1] if i + 1 < len(_STAGE_ORDER) else None
-
-
-# Результаты handle_plan_approval — простые строковые константы.
-PLAN_APPROVAL_APPROVED = "approved"
-PLAN_APPROVAL_REJECTED = "rejected"
-PLAN_APPROVAL_RETRY    = "retry"
+# ── Use cases работы с задачей ────────────────────────────────────────────────
+# Логика стадий, промпты, парсеры и драйвер вынесены в app/:
+#   app.parsers          — parse_questions, parse_validation_verdict
+#   app.stage_prompts    — STAGE_PROMPTS, build_task_block, next_forward_state
+#   app.task_driver      — advance_task, handle_plan_approval, handle_plan_revision
 
 _YES = {"y", "yes", "да", "д"}
 _NO  = {"n", "no", "нет", "н"}
-
-
-def handle_plan_approval(task: Task, user_input: str, task_repo: TaskRepository) -> str:
-    """Обработать y/n на запрос утверждения плана.
-
-    Только мутирует task. UI и запуск execution делает main(), чтобы здесь
-    не было зависимости от chat()/Spinner.
-    """
-    if task.awaiting != "plan_approval":
-        raise RuntimeError(f"Задача не ждёт plan_approval (awaiting={task.awaiting!r})")
-    ans = user_input.strip().lower()
-    if ans in _YES:
-        st = task.stages.get(TaskState.PLANNING)
-        if st is not None:
-            st.status      = StageStatus.DONE
-            st.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
-            task.stages[TaskState.PLANNING] = st
-        task.awaiting = None
-        task_repo.transition(task, TaskState.EXECUTION, reason="план утверждён пользователем")
-        return PLAN_APPROVAL_APPROVED
-    if ans in _NO:
-        task.awaiting = "plan_revision_input"
-        task_repo.save(task)
-        return PLAN_APPROVAL_REJECTED
-    return PLAN_APPROVAL_RETRY
-
-
-def handle_plan_revision(task: Task, user_input: str, task_repo: TaskRepository) -> None:
-    """Зафиксировать правки от пользователя и подготовить planning к перегенерации.
-
-    Старый план уходит в stages[planning].artifacts["revisions"], output чистится,
-    статус сбрасывается в pending — следующий advance_task стартует «с нуля» и
-    напишет новый план целиком. Пожелания пользователя сохраняются в answers
-    с kind="plan_revision" и попадают в task_block следующего вызова.
-    """
-    if task.awaiting != "plan_revision_input":
-        raise RuntimeError(f"Задача не ждёт plan_revision_input (awaiting={task.awaiting!r})")
-    if not user_input.strip():
-        raise RuntimeError("Пустой ответ — нечего править")
-
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    st  = task.stages.get(TaskState.PLANNING)
-    if st is not None and st.output:
-        revisions = st.artifacts.setdefault("revisions", [])
-        revisions.append({"output": st.output, "at": now})
-        st.output       = ""
-        st.status       = StageStatus.PENDING
-        st.started_at   = None
-        st.finished_at  = None
-        task.stages[TaskState.PLANNING] = st
-
-    task.answers.append({
-        "kind":  "plan_revision",
-        "stage": TaskState.PLANNING,
-        "q":     "Что нужно поправить в плане?",
-        "a":     user_input,
-        "at":    now,
-    })
-    task.awaiting = None
-    task_repo.save(task)
 
 
 def announce_task_transitions(task: Task, prev_state: str) -> None:
@@ -920,7 +610,7 @@ def handle_task(cmd_str: str,
         if not task:
             print(f"{YELLOW}  Активной задачи нет.{RESET}")
             return
-        nxt = _next_forward_state(task.state)
+        nxt = next_forward_state(task.state)
         if not nxt:
             print(f"{YELLOW}  Из {task.state} вперёд идти некуда.{RESET}")
             return
@@ -1024,31 +714,6 @@ def handle_task(cmd_str: str,
     print(f"{YELLOW}  Подкоманды /task: new · show · list · resume · advance · back · "
           f"abort · done · delete · log{RESET}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Построение system prompt из всех слоёв памяти
-# ══════════════════════════════════════════════════════════════════════════════
-def build_system_prompt(profile_text: Optional[str],
-                        wm: WorkingMemory,
-                        knowledge_repo: KnowledgeRepository) -> Optional[str]:
-    """
-    Долговременная память (профиль + знания) + рабочая память → system prompt.
-    Краткосрочная (messages) передаётся отдельно как история диалога.
-    """
-    parts = []
-
-    if profile_text:
-        parts.append(f"[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — Профиль]\n{profile_text}")
-
-    knowledge = knowledge_repo.all_as_prompt()
-    if knowledge:
-        parts.append(f"[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — База знаний]\n{knowledge}")
-
-    wm_text = wm.to_prompt()
-    if wm_text:
-        parts.append(wm_text)
-
-    return "\n\n".join(parts) if parts else None
 
 # ── HTTP / GigaChat ───────────────────────────────────────────────────────────
 # OAuth, токен-кэш и вызов модели — в infra.gigachat_client.RequestsGigaChatClient.
