@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
 import uuid
 import time
 import json
@@ -49,6 +50,8 @@ HISTORY_DIR  = os.path.expanduser("~/.jarvis/sessions")
 PROFILES_DIR = os.path.expanduser("~/.jarvis/profiles")
 WORKING_DIR  = os.path.expanduser("~/.jarvis/working")
 KNOWLEDGE_DIR = os.path.expanduser("~/.jarvis/knowledge")
+TASKS_DIR    = os.path.expanduser("~/.jarvis/tasks")
+ACTIVE_TASK_FILE = os.path.join(TASKS_DIR, "active")
 MAX_SESSIONS = 20
 
 DEFAULT_PROFILE_CONTENT = """\
@@ -605,6 +608,877 @@ def clear_session(messages: list):
     _current_session_file = None
 
 # ══════════════════════════════════════════════════════════════════════════════
+# СЛОЙ 4 — МАШИНА СОСТОЯНИЙ ЗАДАЧИ: структура данных и персистентность
+# ══════════════════════════════════════════════════════════════════════════════
+class TaskState:
+    INTAKE     = "intake"
+    PLANNING   = "planning"
+    EXECUTION  = "execution"
+    VALIDATION = "validation"
+    DONE       = "done"
+    ABORTED    = "aborted"
+
+    ALL = [INTAKE, PLANNING, EXECUTION, VALIDATION, DONE, ABORTED]
+    TERMINAL = {DONE, ABORTED}
+
+
+# Разрешённые переходы. Откат validation → planning умышленно запрещён:
+# если на этапе валидации выяснилось, что план плох, сначала идём в execution,
+# а оттуда уже в planning. Это сохраняет инвариант «после planning всегда
+# был хотя бы один заход в execution».
+_ALLOWED_TRANSITIONS = {
+    TaskState.INTAKE     : {TaskState.PLANNING,  TaskState.ABORTED},
+    TaskState.PLANNING   : {TaskState.EXECUTION, TaskState.INTAKE,    TaskState.ABORTED},
+    TaskState.EXECUTION  : {TaskState.VALIDATION, TaskState.PLANNING, TaskState.ABORTED},
+    TaskState.VALIDATION : {TaskState.EXECUTION, TaskState.DONE,      TaskState.ABORTED},
+    TaskState.DONE       : set(),
+    TaskState.ABORTED    : set(),
+}
+
+
+class TaskTransitionError(Exception):
+    pass
+
+
+class StageStatus:
+    PENDING       = "pending"
+    IN_PROGRESS   = "in_progress"
+    AWAITING_USER = "awaiting_user"
+    DONE          = "done"
+    FAILED        = "failed"
+
+
+class StageResult:
+    """Результат одной стадии задачи."""
+
+    def __init__(self,
+                 status: str = StageStatus.PENDING,
+                 output: str = "",
+                 artifacts: Optional[dict] = None,
+                 started_at: Optional[str] = None,
+                 finished_at: Optional[str] = None):
+        self.status      = status
+        self.output      = output
+        self.artifacts   = artifacts if artifacts is not None else {}
+        self.started_at  = started_at
+        self.finished_at = finished_at
+
+    def to_dict(self) -> dict:
+        return {
+            "status":      self.status,
+            "output":      self.output,
+            "artifacts":   self.artifacts,
+            "started_at":  self.started_at,
+            "finished_at": self.finished_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StageResult":
+        return cls(
+            status      = d.get("status", StageStatus.PENDING),
+            output      = d.get("output", ""),
+            artifacts   = d.get("artifacts") or {},
+            started_at  = d.get("started_at"),
+            finished_at = d.get("finished_at"),
+        )
+
+
+class Task:
+    """Задача с явной машиной состояний и персистентностью.
+
+    Шаг 1: только структура данных + сериализация. Логика переходов,
+    драйвер стадий, парсинг вопросов и UI добавляются на следующих шагах.
+    """
+
+    def __init__(self,
+                 id: str,
+                 title: str,
+                 request: str,
+                 state: str = TaskState.INTAKE,
+                 stages: Optional[dict] = None,
+                 context: Optional[dict] = None,
+                 pending_questions: Optional[list] = None,
+                 answers: Optional[list] = None,
+                 awaiting: Optional[str] = None,
+                 profile_snapshot: Optional[str] = None,
+                 model_snapshot: Optional[str] = None,
+                 created_at: Optional[str] = None,
+                 updated_at: Optional[str] = None,
+                 transitions: Optional[list] = None):
+        self.id                = id
+        self.title             = title
+        self.request           = request
+        self.state             = state
+        self.stages            = stages if stages is not None else {}
+        self.context           = context if context is not None else {}
+        self.pending_questions = pending_questions if pending_questions is not None else []
+        self.answers           = answers if answers is not None else []
+        self.awaiting          = awaiting
+        self.profile_snapshot  = profile_snapshot
+        self.model_snapshot    = model_snapshot
+        self.created_at        = created_at
+        self.updated_at        = updated_at
+        self.transitions       = transitions if transitions is not None else []
+
+    # ── factory ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def new(cls,
+            request: str,
+            profile: Optional[str] = None,
+            model: Optional[str] = None) -> "Task":
+        now   = time.strftime("%Y-%m-%d %H:%M")
+        title = request.strip().split("\n", 1)[0][:60] or "—"
+        return cls(
+            id               = uuid.uuid4().hex[:8],
+            title            = title,
+            request          = request,
+            state            = TaskState.INTAKE,
+            profile_snapshot = profile,
+            model_snapshot   = model,
+            created_at       = now,
+            updated_at       = now,
+        )
+
+    # ── state machine ────────────────────────────────────────────────────────
+
+    def can_transition(self, new_state: str) -> bool:
+        return new_state in _ALLOWED_TRANSITIONS.get(self.state, set())
+
+    def transition(self, new_state: str, reason: str = "", save: bool = True):
+        """Перевести задачу в новое состояние.
+
+        Запись в `transitions` идёт всегда, save() вызывается по умолчанию,
+        чтобы переживать падения между шагами. Передай save=False, если
+        хочешь сгруппировать несколько изменений и сохранить один раз.
+        """
+        if new_state not in TaskState.ALL:
+            raise TaskTransitionError(f"Неизвестное состояние: {new_state!r}")
+        if not self.can_transition(new_state):
+            allowed = sorted(_ALLOWED_TRANSITIONS.get(self.state, set()))
+            raise TaskTransitionError(
+                f"Запрещённый переход: {self.state} → {new_state}. "
+                f"Разрешено из {self.state}: {allowed or 'ничего (терминальное состояние)'}"
+            )
+        self.transitions.append({
+            "from":   self.state,
+            "to":     new_state,
+            "at":     time.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+        })
+        self.state = new_state
+        if save:
+            self.save()
+
+    def is_terminal(self) -> bool:
+        return self.state in TaskState.TERMINAL
+
+    # ── serialization ────────────────────────────────────────────────────────
+
+    def to_dict(self) -> dict:
+        return {
+            "id":                self.id,
+            "title":             self.title,
+            "request":           self.request,
+            "state":             self.state,
+            "stages":            {k: v.to_dict() for k, v in self.stages.items()},
+            "context":           self.context,
+            "pending_questions": self.pending_questions,
+            "answers":           self.answers,
+            "awaiting":          self.awaiting,
+            "profile_snapshot":  self.profile_snapshot,
+            "model_snapshot":    self.model_snapshot,
+            "created_at":        self.created_at,
+            "updated_at":        self.updated_at,
+            "transitions":       self.transitions,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Task":
+        raw_stages = d.get("stages") or {}
+        stages = {k: StageResult.from_dict(v) for k, v in raw_stages.items()}
+        return cls(
+            id                = d["id"],
+            title             = d.get("title", "—"),
+            request           = d.get("request", ""),
+            state             = d.get("state", TaskState.INTAKE),
+            stages            = stages,
+            context           = d.get("context") or {},
+            pending_questions = d.get("pending_questions") or [],
+            answers           = d.get("answers") or [],
+            awaiting          = d.get("awaiting"),
+            profile_snapshot  = d.get("profile_snapshot"),
+            model_snapshot    = d.get("model_snapshot"),
+            created_at        = d.get("created_at"),
+            updated_at        = d.get("updated_at"),
+            transitions       = d.get("transitions") or [],
+        )
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _path(task_id: str) -> str:
+        return os.path.join(TASKS_DIR, f"{task_id}.json")
+
+    def save(self):
+        os.makedirs(TASKS_DIR, exist_ok=True)
+        self.updated_at = time.strftime("%Y-%m-%d %H:%M")
+        with open(self._path(self.id), "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, task_id: str) -> Optional["Task"]:
+        path = cls._path(task_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                return cls.from_dict(json.load(f))
+        except Exception:
+            return None
+
+    @classmethod
+    def list_all(cls) -> list:
+        if not os.path.isdir(TASKS_DIR):
+            return []
+        tasks = []
+        for fname in os.listdir(TASKS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            t = cls.load(os.path.splitext(fname)[0])
+            if t is not None:
+                tasks.append(t)
+        tasks.sort(key=lambda t: t.updated_at or "", reverse=True)
+        return tasks
+
+    def delete(self):
+        path = self._path(self.id)
+        if os.path.exists(path):
+            os.remove(path)
+        if Task.get_active_id() == self.id:
+            Task.clear_active()
+
+    # ── active task pointer ──────────────────────────────────────────────────
+
+    def set_active(self):
+        os.makedirs(TASKS_DIR, exist_ok=True)
+        with open(ACTIVE_TASK_FILE, "w", encoding="utf-8") as f:
+            f.write(self.id)
+
+    @staticmethod
+    def get_active_id() -> Optional[str]:
+        if not os.path.exists(ACTIVE_TASK_FILE):
+            return None
+        try:
+            with open(ACTIVE_TASK_FILE, encoding="utf-8") as f:
+                tid = f.read().strip()
+            return tid or None
+        except Exception:
+            return None
+
+    @classmethod
+    def get_active(cls) -> Optional["Task"]:
+        tid = cls.get_active_id()
+        if not tid:
+            return None
+        return cls.load(tid)
+
+    @staticmethod
+    def clear_active():
+        if os.path.exists(ACTIVE_TASK_FILE):
+            os.remove(ACTIVE_TASK_FILE)
+
+
+# ── Stage prompts + driver ────────────────────────────────────────────────────
+QUESTION_PROTOCOL = (
+    "ПРАВИЛО УТОЧНЕНИЙ: если на любом этапе тебе не хватает данных, чтобы продолжать "
+    "уверенно — задай уточняющий вопрос пользователю. Каждый такой вопрос ОБЯЗАТЕЛЬНО "
+    "оформи отдельной строкой ровно в формате:\n"
+    "[QUESTION] <текст вопроса>\n"
+    "Можно несколько подряд. Если вопросов нет — НЕ используй этот тег вовсе."
+)
+
+STAGE_PROMPTS = {
+    TaskState.INTAKE: (
+        "Сейчас стадия INTAKE — сбор и уточнение задачи.\n"
+        "Цель: за ОДИН раунд убедиться, что задача понятна для планирования. Не более.\n"
+        "Если в разделе «Уточнения от пользователя» выше уже есть ответы — считай задачу понятной "
+        "и НЕ задавай новых вопросов: переходи к итоговой формулировке.\n"
+        "Если ответов пользователя ещё нет и в исходном запросе есть КРИТИЧНЫЕ неясности, без которых "
+        "нельзя составить план — задай 1–3 самых важных уточняющих вопроса (см. ПРАВИЛО УТОЧНЕНИЙ). "
+        "Не задавай вопросов о деталях, которые можно решить разумным дефолтом позже на стадии планирования.\n"
+        "Когда готов: сформулируй задачу одним абзацем и заверши ответ — НЕ используй [QUESTION]."
+    ),
+    TaskState.PLANNING: (
+        "Сейчас стадия PLANNING — составление плана.\n"
+        "На основе уточнённой задачи составь подробный пошаговый план: пронумерованные пункты, "
+        "у каждого — что именно будет сделано и какой ожидаемый результат.\n"
+        "Если для составления плана не хватает данных — сначала задай уточняющие вопросы "
+        "(см. ПРАВИЛО УТОЧНЕНИЙ) и НЕ выводи план в этом ответе.\n"
+        "Когда план готов — в самом конце ответа ОБЯЗАТЕЛЬНО спроси дословно: «Утвердить план? [y/n]»"
+    ),
+    TaskState.EXECUTION: (
+        "Сейчас стадия EXECUTION — выполнение утверждённого плана.\n"
+        "Выполняй пункты плана по порядку. По каждому пункту опиши, что сделано и какой получился результат.\n"
+        "Если по ходу выяснилось, что план неверен — явно скажи об этом, не продолжай вслепую.\n"
+        "Если нужны данные от пользователя — задай уточняющий вопрос (см. ПРАВИЛО УТОЧНЕНИЙ)."
+    ),
+    TaskState.VALIDATION: (
+        "Сейчас стадия VALIDATION — проверка результата.\n"
+        "Сверь сделанное с утверждённым планом и исходным запросом.\n"
+        "Перечисли найденные проблемы конкретными пунктами; если проблем нет — скажи прямо, что всё в порядке.\n"
+        "Если для проверки не хватает данных — задай уточняющий вопрос (см. ПРАВИЛО УТОЧНЕНИЙ).\n"
+        "\n"
+        "Заверши ответ ОДНОЙ из меток ровно на отдельной строке:\n"
+        "  [VALIDATION OK]     — если проблем не найдено и задачу можно завершать;\n"
+        "  [VALIDATION ISSUES] — если есть проблемы (они перечислены выше, нужно вернуться к выполнению).\n"
+        "Без [QUESTION] и без обеих меток сразу. Если есть незакрытые [QUESTION] — метку НЕ ставь."
+    ),
+}
+
+# Маркер вопроса: строка, начинающаяся с [QUESTION]. Захватываем всё до следующего
+# тега-в-начале-строки (любой [XXX] из заглавных букв/пробелов) или до конца текста,
+# поддерживая многострочные формулировки. Тег-разделитель шире, чем сам [QUESTION],
+# чтобы корректно отделять вопросы от меток вердикта вроде [VALIDATION OK].
+_QUESTION_RE = re.compile(
+    r"^\s*\[QUESTION\]\s*(.+?)(?=^\s*\[[A-Z][A-Z _]*\]|\Z)",
+    re.MULTILINE | re.DOTALL)
+
+
+def parse_questions(text: str) -> list:
+    """Извлекает вопросы агента из ответа модели."""
+    return [m.strip() for m in _QUESTION_RE.findall(text) if m.strip()]
+
+
+# Метки вердикта стадии validation. Якорим на начало строки, чтобы случайные
+# упоминания «[VALIDATION OK]» внутри прозы не триггерили автопереход.
+_VALIDATION_OK_RE = re.compile(
+    r"^\s*\[VALIDATION\s+OK\]\s*$", re.MULTILINE | re.IGNORECASE)
+_VALIDATION_ISSUES_RE = re.compile(
+    r"^\s*\[VALIDATION\s+(?:ISSUES|FAILED|FAIL|NOK)\]\s*$",
+    re.MULTILINE | re.IGNORECASE)
+
+
+def parse_validation_verdict(text: str) -> Optional[str]:
+    """Возвращает 'ok', 'issues' или None (вердикт не задан).
+
+    Если в ответе одновременно есть обе метки — приоритет у issues
+    (безопаснее: лучше пройти ещё один круг execution, чем закрыть с проблемами).
+    """
+    has_issues = bool(_VALIDATION_ISSUES_RE.search(text))
+    has_ok     = bool(_VALIDATION_OK_RE.search(text))
+    if has_issues:
+        return "issues"
+    if has_ok:
+        return "ok"
+    return None
+
+# Порядок стадий «вперёд» — нужен для построения контекста и команды /task advance.
+_STAGE_ORDER = [
+    TaskState.INTAKE,
+    TaskState.PLANNING,
+    TaskState.EXECUTION,
+    TaskState.VALIDATION,
+    TaskState.DONE,
+]
+
+
+def build_task_block(task: Task, restoration_hint: bool = False) -> str:
+    """Блок [ЗАДАЧА] для system prompt: контекст, прошлые стадии, инструкция для текущей.
+
+    Если restoration_hint=True — добавляется блок «возобновление после перерыва»,
+    просящий модель кратко напомнить пользователю, на чём остановились.
+    """
+    lines = [f"[ЗАДАЧА #{task.id}: {task.title}]"]
+    lines.append(f"Исходный запрос пользователя: {task.request}")
+    lines.append(f"Текущая стадия: {task.state}")
+
+    if task.context:
+        lines.append("Контекст задачи:")
+        for k, v in task.context.items():
+            lines.append(f"  {k}: {v}")
+
+    # результаты прошлых стадий (всё, что строго до текущей)
+    for s in _STAGE_ORDER:
+        if s == task.state:
+            break
+        result = task.stages.get(s)
+        if result and result.output:
+            lines.append(f"\n--- Результат стадии {s} ---\n{result.output}")
+
+    if task.answers:
+        lines.append("\n--- Уточнения от пользователя ---")
+        for a in task.answers:
+            lines.append(f"Q: {a.get('q','')}\nA: {a.get('a','')}")
+
+    instr = STAGE_PROMPTS.get(task.state)
+    if instr:
+        lines.append(f"\n--- Инструкция для текущей стадии ({task.state}) ---\n{instr}")
+
+    lines.append(f"\n--- Протокол уточнений ---\n{QUESTION_PROTOCOL}")
+
+    if restoration_hint:
+        lines.append(
+            "\n--- Возобновление после перерыва ---\n"
+            "Работа над этой задачей была прервана (закрыт чат / истекло время / "
+            "пропала связь) и сейчас возобновлена. Прежде чем продолжать стадию, "
+            "начни ответ с краткого (1–2 предложения) напоминания, на чём именно "
+            "остановились — чтобы пользователь быстро восстановил контекст. "
+            "Потом продолжай как обычно."
+        )
+
+    return "\n".join(lines)
+
+
+def advance_task(task: Task,
+                 user_input: str,
+                 params: dict,
+                 profile_text: Optional[str],
+                 wm: "WorkingMemory",
+                 restoration_hint: bool = False) -> str:
+    """Один прогон текущей стадии через модель.
+
+    Если у задачи есть незакрытые вопросы (pending_questions), user_input
+    трактуется как ответ на них: пишется в task.answers, очищается список
+    вопросов, и только после этого зовётся модель. Если модель в новом ответе
+    задаёт новые [QUESTION] — стадия остаётся awaiting_user; иначе — done.
+    """
+    if task.is_terminal():
+        raise RuntimeError(f"Задача в терминальном состоянии: {task.state}")
+    if task.state not in STAGE_PROMPTS:
+        raise RuntimeError(f"Для стадии {task.state} нет промпта")
+
+    # Если уже ждём чего-то отличного от уточнения (например, plan_approval) —
+    # на это есть отдельный обработчик; этот код такой ввод не трогает.
+    if task.awaiting and task.awaiting != "clarification":
+        raise RuntimeError(f"Задача ожидает {task.awaiting}, а не свободного ответа")
+
+    # 1) Если ждали ответа на уточнения — фиксируем его в answers.
+    if task.pending_questions and user_input:
+        task.answers.append({
+            "kind":  "clarification",
+            "stage": task.state,
+            "q":     "\n".join(task.pending_questions),
+            "a":     user_input,
+            "at":    time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        task.pending_questions = []
+        task.awaiting = None
+        task.save()
+        # user_input уже впитан в answers и попадёт в task_block — не дублируем
+        # его как отдельное user-message, чтобы модель не отвечала на ответ как
+        # на новый вопрос.
+        followup_message = ""
+    else:
+        followup_message = user_input
+
+    stage_obj = task.stages.get(task.state) or StageResult()
+    if stage_obj.started_at is None:
+        stage_obj.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    stage_obj.status = StageStatus.IN_PROGRESS
+    task.stages[task.state] = stage_obj
+    task.save()
+
+    base = build_system_prompt(profile_text, wm) or ""
+    task_block = build_task_block(task, restoration_hint=restoration_hint)
+    system_prompt = (base + "\n\n" + task_block) if base else task_block
+
+    stage_messages = []
+    if followup_message:
+        stage_messages.append({"role": "user", "content": followup_message})
+
+    try:
+        reply = chat(stage_messages, params, system_prompt)
+    except Exception:
+        stage_obj.status = StageStatus.FAILED
+        task.save()
+        raise
+
+    # Накапливаем вывод стадии (важно при многошаговых итерациях).
+    stage_obj.output = (stage_obj.output + "\n\n" + reply).strip() if stage_obj.output else reply
+
+    # Разбираем reply: если в нём есть [QUESTION] — ставим awaiting_user.
+    questions = parse_questions(reply)
+    if questions:
+        task.pending_questions = questions
+        task.awaiting = "clarification"
+        stage_obj.status = StageStatus.AWAITING_USER
+        task.stages[task.state] = stage_obj
+        task.save()
+        return reply
+
+    if task.state == TaskState.PLANNING:
+        # План готов — стадия не закрывается, ждём явного y/n от пользователя.
+        # finished_at выставится позже, в handle_plan_approval после "y".
+        task.pending_questions = []
+        task.awaiting = "plan_approval"
+        stage_obj.status = StageStatus.AWAITING_USER
+        task.stages[task.state] = stage_obj
+        task.save()
+        return reply
+
+    # Стадия отработала без вопросов — закрываем её.
+    task.pending_questions = []
+    task.awaiting = None
+    stage_obj.status = StageStatus.DONE
+    stage_obj.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    task.stages[task.state] = stage_obj
+    task.save()
+
+    # Стадия intake: ответ без [QUESTION] означает, что модель готова планировать.
+    # Без автоперехода задача залипает в intake и следующее сообщение пользователя
+    # снова запускает intake-промпт, который снова просит уточнений — отсюда петля
+    # и повторы одних и тех же вопросов.
+    if task.state == TaskState.INTAKE:
+        task.transition(TaskState.PLANNING, reason="уточнения собраны, переходим к плану")
+
+    # Стадия validation: автоматический переход по вердикту модели.
+    if task.state == TaskState.VALIDATION:
+        verdict = parse_validation_verdict(reply)
+        if verdict == "ok":
+            task.transition(TaskState.DONE, reason="валидация пройдена")
+        elif verdict == "issues":
+            task.transition(TaskState.EXECUTION, reason="валидация выявила проблемы")
+        # verdict == None — оставляем validation done, пользователь решит руками.
+
+    return reply
+
+
+def _next_forward_state(state: str) -> Optional[str]:
+    """Следующая стадия по линейному порядку (для /task advance)."""
+    try:
+        i = _STAGE_ORDER.index(state)
+    except ValueError:
+        return None
+    return _STAGE_ORDER[i + 1] if i + 1 < len(_STAGE_ORDER) else None
+
+
+# Результаты handle_plan_approval — простые строковые константы.
+PLAN_APPROVAL_APPROVED = "approved"
+PLAN_APPROVAL_REJECTED = "rejected"
+PLAN_APPROVAL_RETRY    = "retry"
+
+_YES = {"y", "yes", "да", "д"}
+_NO  = {"n", "no", "нет", "н"}
+
+
+def handle_plan_approval(task: Task, user_input: str) -> str:
+    """Обработать y/n на запрос утверждения плана.
+
+    Только мутирует task. UI и запуск execution делает main(), чтобы здесь
+    не было зависимости от chat()/Spinner.
+    """
+    if task.awaiting != "plan_approval":
+        raise RuntimeError(f"Задача не ждёт plan_approval (awaiting={task.awaiting!r})")
+    ans = user_input.strip().lower()
+    if ans in _YES:
+        st = task.stages.get(TaskState.PLANNING)
+        if st is not None:
+            st.status      = StageStatus.DONE
+            st.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            task.stages[TaskState.PLANNING] = st
+        task.awaiting = None
+        task.transition(TaskState.EXECUTION, reason="план утверждён пользователем")
+        return PLAN_APPROVAL_APPROVED
+    if ans in _NO:
+        task.awaiting = "plan_revision_input"
+        task.save()
+        return PLAN_APPROVAL_REJECTED
+    return PLAN_APPROVAL_RETRY
+
+
+def handle_plan_revision(task: Task, user_input: str) -> None:
+    """Зафиксировать правки от пользователя и подготовить planning к перегенерации.
+
+    Старый план уходит в stages[planning].artifacts["revisions"], output чистится,
+    статус сбрасывается в pending — следующий advance_task стартует «с нуля» и
+    напишет новый план целиком. Пожелания пользователя сохраняются в answers
+    с kind="plan_revision" и попадают в task_block следующего вызова.
+    """
+    if task.awaiting != "plan_revision_input":
+        raise RuntimeError(f"Задача не ждёт plan_revision_input (awaiting={task.awaiting!r})")
+    if not user_input.strip():
+        raise RuntimeError("Пустой ответ — нечего править")
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    st  = task.stages.get(TaskState.PLANNING)
+    if st is not None and st.output:
+        revisions = st.artifacts.setdefault("revisions", [])
+        revisions.append({"output": st.output, "at": now})
+        st.output       = ""
+        st.status       = StageStatus.PENDING
+        st.started_at   = None
+        st.finished_at  = None
+        task.stages[TaskState.PLANNING] = st
+
+    task.answers.append({
+        "kind":  "plan_revision",
+        "stage": TaskState.PLANNING,
+        "q":     "Что нужно поправить в плане?",
+        "a":     user_input,
+        "at":    now,
+    })
+    task.awaiting = None
+    task.save()
+
+
+def announce_task_transitions(task: Task, prev_state: str) -> None:
+    """Если стадия изменилась во время advance_task — печатаем явное сообщение.
+    Помогает не пропустить validation→execution или достижение done.
+    """
+    if task.state == prev_state:
+        return
+    if task.state == TaskState.DONE:
+        print(f"\n{GREEN}{BOLD}✓ Задача #{task.id} завершена (validation OK).{RESET}\n")
+    elif prev_state == TaskState.VALIDATION and task.state == TaskState.EXECUTION:
+        print(f"\n{YELLOW}↻ Валидация нашла проблемы — возвращаемся к выполнению.{RESET}\n")
+    elif prev_state == TaskState.PLANNING and task.state == TaskState.EXECUTION:
+        print(f"\n{GREEN}→ Перешли к выполнению плана.{RESET}\n")
+    elif prev_state == TaskState.INTAKE and task.state == TaskState.PLANNING:
+        print(f"\n{GREEN}→ Уточнения собраны — перехожу к планированию.{RESET}\n")
+    else:
+        print(f"\n{DIM}→ {prev_state} → {task.state}{RESET}\n")
+
+
+def show_task(task: Task):
+    print(f"\n{BOLD}{MAGENTA}Задача #{task.id}:{RESET} {task.title}")
+    print(f"  {DIM}запрос:{RESET} {task.request}")
+    print(f"  {BOLD}стадия:{RESET} {task.state}")
+    if task.created_at or task.updated_at:
+        print(f"  {DIM}создана: {task.created_at}  обновлена: {task.updated_at}{RESET}")
+    if task.profile_snapshot or task.model_snapshot:
+        print(f"  {DIM}профиль: {task.profile_snapshot or '—'}  модель: {task.model_snapshot or '—'}{RESET}")
+    if task.awaiting:
+        print(f"  {YELLOW}ожидание ввода:{RESET} {task.awaiting}")
+    if task.pending_questions:
+        print(f"  {YELLOW}незакрытые вопросы:{RESET}")
+        for q in task.pending_questions:
+            print(f"    • {q}")
+    if task.stages:
+        print(f"  {BOLD}стадии:{RESET}")
+        for s in _STAGE_ORDER:
+            r = task.stages.get(s)
+            if r is None:
+                continue
+            mark = "◀" if s == task.state else " "
+            extra = ""
+            revs = r.artifacts.get("revisions") if r.artifacts else None
+            if revs:
+                extra += f"  ({len(revs)} версий до текущей)"
+            print(f"    {mark} {s}: {r.status}{extra}")
+    counts = []
+    if task.answers:
+        clar = sum(1 for a in task.answers if a.get("kind") == "clarification")
+        rev  = sum(1 for a in task.answers if a.get("kind") == "plan_revision")
+        if clar:
+            counts.append(f"{clar} уточн.")
+        if rev:
+            counts.append(f"{rev} правок плана")
+    if task.transitions:
+        counts.append(f"{len(task.transitions)} переходов")
+    if counts:
+        print(f"  {DIM}история: {', '.join(counts)}{RESET}")
+    if task.transitions:
+        last = task.transitions[-1]
+        print(f"  {DIM}последний переход: {last['from']} → {last['to']} ({last.get('reason','')}){RESET}")
+    current = task.stages.get(task.state)
+    if current and current.output:
+        print(f"\n  {BOLD}текущий результат:{RESET}\n{current.output}")
+    print()
+
+
+def handle_task(cmd_str: str,
+                params: dict,
+                profile_text: Optional[str],
+                wm: "WorkingMemory") -> None:
+    """Обработка /task <sub> ..."""
+    parts = cmd_str.split(None, 2)
+    sub = parts[1].lower() if len(parts) > 1 else "show"
+
+    if sub == "new":
+        request = parts[2].strip() if len(parts) > 2 else ""
+        if not request:
+            try:
+                request = input("  Опиши задачу: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+        if not request:
+            print(f"{YELLOW}  Пустой запрос — задача не создана.{RESET}")
+            return
+        active = Task.get_active()
+        if active and not active.is_terminal():
+            print(f"{YELLOW}  Уже есть активная задача #{active.id} ({active.state}). "
+                  f"Сначала /task abort или /task done.{RESET}")
+            return
+        # Если active указывает на терминальную задачу — расчищаем перед стартом
+        # новой, чтобы дашборд не висел в неопределённом виде.
+        if active and active.is_terminal():
+            Task.clear_active()
+        task = Task.new(
+            request,
+            profile=profile_name(_current_profile_path) if _current_profile_path else None,
+            model=params["model"],
+        )
+        task.save()
+        task.set_active()
+        print(f"{GREEN}  Создана задача #{task.id} (стадия: {task.state}).{RESET}")
+        try:
+            with Spinner("Думаю..."):
+                reply = advance_task(task, request, params, profile_text, wm)
+        except Exception as e:
+            print(f"{YELLOW}  Ошибка стадии: {e}{RESET}")
+            return
+        print(f"\n{BOLD}{GREEN}Agent:{RESET} {reply}\n")
+        return
+
+    if sub in ("show", ""):
+        task = Task.get_active()
+        if not task:
+            print(f"{DIM}  Активной задачи нет.{RESET}")
+            return
+        show_task(task)
+        return
+
+    if sub == "list":
+        tasks = Task.list_all()
+        if not tasks:
+            print(f"{DIM}  Задач нет.{RESET}")
+            return
+        active_id = Task.get_active_id()
+        print(f"\n{BOLD}Задачи:{RESET}")
+        for t in tasks:
+            mark = f" {YELLOW}◀ активная{RESET}" if t.id == active_id else ""
+            title = t.title[:50] + ("…" if len(t.title) > 50 else "")
+            updated = t.updated_at or "—"
+            print(f"  {CYAN}#{t.id}{RESET}  {t.state:10}  {DIM}{updated}{RESET}  {title}{mark}")
+        print()
+        return
+
+    if sub == "resume":
+        tid = parts[2].strip() if len(parts) > 2 else ""
+        if not tid:
+            print(f"{YELLOW}  Использование: /task resume <id>{RESET}")
+            return
+        t = Task.load(tid)
+        if not t:
+            print(f"{YELLOW}  Задача #{tid} не найдена.{RESET}")
+            return
+        t.set_active()
+        print(f"{GREEN}  Активной выбрана #{t.id} (стадия: {t.state}).{RESET}")
+        show_task(t)
+        return
+
+    if sub == "advance":
+        task = Task.get_active()
+        if not task:
+            print(f"{YELLOW}  Активной задачи нет.{RESET}")
+            return
+        nxt = _next_forward_state(task.state)
+        if not nxt:
+            print(f"{YELLOW}  Из {task.state} вперёд идти некуда.{RESET}")
+            return
+        reason = parts[2].strip() if len(parts) > 2 else "ручной переход вперёд"
+        try:
+            task.transition(nxt, reason=reason)
+        except TaskTransitionError as e:
+            print(f"{YELLOW}  {e}{RESET}")
+            return
+        print(f"{GREEN}  Стадия: {task.state}.{RESET}")
+        return
+
+    if sub == "back":
+        task = Task.get_active()
+        if not task:
+            print(f"{YELLOW}  Активной задачи нет.{RESET}")
+            return
+        target = parts[2].strip() if len(parts) > 2 else ""
+        if not target:
+            print(f"{YELLOW}  Использование: /task back <стадия>{RESET}")
+            return
+        try:
+            task.transition(target, reason="ручной откат")
+        except TaskTransitionError as e:
+            print(f"{YELLOW}  {e}{RESET}")
+            return
+        print(f"{GREEN}  Стадия: {task.state}.{RESET}")
+        return
+
+    if sub == "abort":
+        task = Task.get_active()
+        if not task:
+            print(f"{YELLOW}  Активной задачи нет.{RESET}")
+            return
+        reason = parts[2].strip() if len(parts) > 2 else "пользователь отменил"
+        try:
+            task.transition(TaskState.ABORTED, reason=reason)
+        except TaskTransitionError as e:
+            print(f"{YELLOW}  {e}{RESET}")
+            return
+        Task.clear_active()
+        print(f"{DIM}  Задача #{task.id} отменена.{RESET}")
+        return
+
+    if sub == "done":
+        task = Task.get_active()
+        if not task:
+            print(f"{YELLOW}  Активной задачи нет.{RESET}")
+            return
+        try:
+            task.transition(TaskState.DONE, reason="вручную завершено")
+        except TaskTransitionError as e:
+            print(f"{YELLOW}  {e}{RESET}")
+            return
+        Task.clear_active()
+        print(f"{GREEN}  Задача #{task.id} завершена.{RESET}")
+        return
+
+    if sub == "delete":
+        tid = parts[2].strip() if len(parts) > 2 else ""
+        if not tid:
+            print(f"{YELLOW}  Использование: /task delete <id>{RESET}")
+            return
+        t = Task.load(tid)
+        if not t:
+            # Файл задачи мог отсутствовать (никогда не сохранялась), но active
+            # pointer всё ещё может на неё указывать — почистим, чтобы дашборд
+            # не показывал «призрак».
+            if Task.get_active_id() == tid:
+                Task.clear_active()
+                print(f"{YELLOW}  Задача #{tid} не найдена на диске; active-указатель очищен.{RESET}")
+            else:
+                print(f"{YELLOW}  Задача #{tid} не найдена.{RESET}")
+            return
+        try:
+            confirm = input(f"  Удалить задачу #{t.id} «{t.title}»? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if confirm not in _YES:
+            print(f"{DIM}  Отменено.{RESET}")
+            return
+        t.delete()  # сама подчистит active pointer если нужно
+        print(f"{GREEN}  Задача #{tid} удалена.{RESET}")
+        return
+
+    if sub == "log":
+        tid = parts[2].strip() if len(parts) > 2 else ""
+        task = Task.load(tid) if tid else Task.get_active()
+        if not task:
+            print(f"{YELLOW}  {'Задача не найдена.' if tid else 'Активной задачи нет.'}{RESET}")
+            return
+        print(f"\n{BOLD}История задачи #{task.id}:{RESET}")
+        if not task.transitions:
+            print(f"  {DIM}переходов ещё не было{RESET}")
+        for tr in task.transitions:
+            reason = tr.get("reason", "") or ""
+            print(f"  {DIM}{tr.get('at','')}{RESET}  {tr['from']:10} → {tr['to']:10}  {DIM}{reason}{RESET}")
+        print()
+        return
+
+    print(f"{YELLOW}  Подкоманды /task: new · show · list · resume · advance · back · "
+          f"abort · done · delete · log{RESET}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Построение system prompt из всех слоёв памяти
 # ══════════════════════════════════════════════════════════════════════════════
 def build_system_prompt(profile_text: Optional[str], wm: WorkingMemory) -> Optional[str]:
@@ -682,8 +1556,25 @@ def print_settings(params: dict):
     pname = profile_name(_current_profile_path) if _current_profile_path else "нет"
     print(f"{DIM}  модель: {params['model']}  temperature: {temp}  max_tokens: {maxt}  профиль: {pname}{RESET}")
 
+def _task_status_badge() -> str:
+    """Однострочный индикатор активной задачи для общего дашборда."""
+    task = Task.get_active()
+    if not task or task.is_terminal():
+        return f"{DIM}задача: —{RESET}"
+    short = task.title[:30] + ("…" if len(task.title) > 30 else "")
+    extras = []
+    if task.awaiting == "plan_approval":
+        extras.append("ждёт y/n плана")
+    elif task.awaiting == "plan_revision_input":
+        extras.append("ждёт правок плана")
+    elif task.pending_questions:
+        extras.append(f"{len(task.pending_questions)} вопр.")
+    suffix = f" · {', '.join(extras)}" if extras else ""
+    return f"{YELLOW}задача: #{task.id} {task.state} · {short}{suffix}{RESET}"
+
+
 def print_memory_status(messages: list, wm: WorkingMemory):
-    """Однострочный дашборд трёх слоёв памяти."""
+    """Однострочный дашборд всех слоёв памяти + активная задача."""
     # краткосрочная
     st_label = f"{GREEN}краткосрочная: {len(messages)} сообщ.{RESET}" if messages \
                else f"{DIM}краткосрочная: —{RESET}"
@@ -696,8 +1587,10 @@ def print_memory_status(messages: list, wm: WorkingMemory):
     if kfiles:
         lt_label += f", {len(kfiles)} знаний"
     lt_label += RESET
+    # задача
+    task_label = _task_status_badge()
 
-    print(f"  {st_label}  │  {wm_label}  │  {lt_label}")
+    print(f"  {st_label}  │  {wm_label}  │  {lt_label}  │  {task_label}")
 
 def print_mem_detail(messages: list, wm: WorkingMemory):
     """Подробный вывод всех трёх слоёв."""
@@ -730,6 +1623,22 @@ def print_mem_detail(messages: list, wm: WorkingMemory):
             print(f"      {BLUE}•{RESET} {os.path.splitext(fname)[0]}")
     else:
         print(f"    {DIM}База знаний пуста. Используй /know save{RESET}")
+
+    # Слой 4
+    print(f"\n{BOLD}{YELLOW}[4] Задача{RESET}  {DIM}(машина состояний){RESET}")
+    active = Task.get_active()
+    if active and not active.is_terminal():
+        print(f"    Активная: #{active.id} «{active.title}» (стадия: {active.state})")
+        if active.awaiting:
+            print(f"    {YELLOW}Ожидание ввода:{RESET} {active.awaiting}")
+    else:
+        print(f"    {DIM}Активной задачи нет.{RESET}")
+    all_tasks = Task.list_all()
+    if all_tasks:
+        nonterm = sum(1 for t in all_tasks if not t.is_terminal())
+        done    = sum(1 for t in all_tasks if t.state == TaskState.DONE)
+        abort   = sum(1 for t in all_tasks if t.state == TaskState.ABORTED)
+        print(f"    {DIM}всего задач: {len(all_tasks)} (активные: {nonterm}, done: {done}, aborted: {abort}){RESET}")
     print()
 
 def choose_model(params: dict):
@@ -778,6 +1687,23 @@ def print_help():
   {CYAN}/know list{RESET}       — список записей
   {CYAN}/know save <имя>{RESET} — сохранить знание
   {CYAN}/know show <имя>{RESET} — показать запись
+
+{BOLD}Задачи (/task):{RESET}
+  {CYAN}/task new <описание>{RESET} — создать задачу и начать стадию intake
+  {CYAN}/task{RESET}                — показать активную задачу
+  {CYAN}/task list{RESET}           — список всех задач
+  {CYAN}/task resume <id>{RESET}    — сделать другую задачу активной
+  {CYAN}/task advance{RESET}        — перейти в следующую стадию вперёд
+  {CYAN}/task back <стадия>{RESET}  — откатить на указанную стадию
+  {CYAN}/task log [id]{RESET}       — история переходов задачи
+  {CYAN}/task abort{RESET}          — отменить задачу
+  {CYAN}/task done{RESET}           — пометить задачу завершённой
+  {CYAN}/task delete <id>{RESET}    — удалить задачу с диска
+  {DIM}Шлюзы и автопереходы:
+    planning → execution     по «y» (или «n» → правки плана)
+    validation → done        по метке [VALIDATION OK] от модели
+    validation → execution   по метке [VALIDATION ISSUES] от модели
+    [QUESTION] в ответе      → задача переходит в режим ожидания ответа{RESET}
 
 {BOLD}Профиль:{RESET}
   {CYAN}/profile{RESET}         — сменить профиль агента
@@ -842,6 +1768,29 @@ def main():
             _current_session_file = s["path"]
             print(f"{DIM}Загружено {len(messages)} сообщений.{RESET}\n")
 
+    # Восстановление активной задачи (Слой 4): спрашиваем пользователя, продолжать ли.
+    pending_restoration_hint = False
+    saved_active = Task.get_active()
+    if saved_active and not saved_active.is_terminal():
+        print(f"{BOLD}{MAGENTA}Найдена активная задача:{RESET}")
+        show_task(saved_active)
+        try:
+            choice = input(f"Продолжить задачу #{saved_active.id}? [y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "n"
+        if choice in _YES:
+            pending_restoration_hint = True
+            if saved_active.awaiting == "plan_approval":
+                print(f"{DIM}  Задача ждёт утверждения плана — ответь y или n.{RESET}")
+            elif saved_active.awaiting == "plan_revision_input":
+                print(f"{DIM}  Задача ждёт правок к плану — опиши, что поправить.{RESET}")
+            elif saved_active.pending_questions:
+                print(f"{DIM}  Задача ждёт ответа на уточняющие вопросы (см. выше).{RESET}")
+            print(f"{GREEN}  Возобновляем.{RESET}\n")
+        else:
+            Task.clear_active()
+            print(f"{DIM}  Задача #{saved_active.id} оставлена в /task list (но не активна).{RESET}\n")
+
     print_settings(params)
     print_memory_status(messages, wm)
     print()
@@ -877,6 +1826,8 @@ def main():
                 handle_wm(user_input, wm)
             elif cmd.startswith("/know"):
                 handle_know(user_input)
+            elif cmd.startswith("/task"):
+                handle_task(user_input, params, _current_profile_text, wm)
             elif cmd == "/profile new":
                 _current_profile_path, _current_profile_text = create_profile()
             elif cmd == "/profile edit":
@@ -892,6 +1843,90 @@ def main():
                 print_help()
             else:
                 print(f"{YELLOW}Неизвестная команда. Введите /help.{RESET}")
+            continue
+
+        # Если есть активная нетерминальная задача — ввод идёт в её драйвер,
+        # а не в обычный чат. Сначала проверяем спец-режимы (plan_approval,
+        # plan_revision_input), потом обычный clarification/stage цикл.
+        active_task = Task.get_active()
+        if active_task and not active_task.is_terminal():
+
+            # === шлюз утверждения плана ===
+            if active_task.awaiting == "plan_approval":
+                result = handle_plan_approval(active_task, user_input)
+                if result == PLAN_APPROVAL_RETRY:
+                    print(f"{YELLOW}  Ответь «y» (одобрить) или «n» (нужны правки).{RESET}")
+                    continue
+                if result == PLAN_APPROVAL_REJECTED:
+                    print(f"{DIM}  План отклонён.{RESET}")
+                    print(f"{BOLD}Что нужно поправить в плане?{RESET}")
+                    continue
+                # APPROVED → planning закрыт, мы уже в execution, сразу запускаем стадию.
+                print(f"{GREEN}  План утверждён. Перехожу к выполнению.{RESET}\n")
+                prev_state = active_task.state
+                try:
+                    with Spinner("Думаю..."):
+                        reply = advance_task(active_task, "", params,
+                                             _current_profile_text, wm,
+                                             restoration_hint=pending_restoration_hint)
+                except Exception as e:
+                    print(f"{YELLOW}Ошибка: {e}{RESET}")
+                    continue
+                pending_restoration_hint = False
+                print(f"{BOLD}{GREEN}Agent:{RESET} {reply}\n")
+                announce_task_transitions(active_task, prev_state)
+                continue
+
+            # === пользователь ответил на «что поправить?» ===
+            if active_task.awaiting == "plan_revision_input":
+                try:
+                    handle_plan_revision(active_task, user_input)
+                except RuntimeError as e:
+                    print(f"{YELLOW}  {e}{RESET}")
+                    continue
+                # Сразу перегенерируем план.
+                prev_state = active_task.state
+                try:
+                    with Spinner("Перепланирую..."):
+                        reply = advance_task(active_task, "", params,
+                                             _current_profile_text, wm,
+                                             restoration_hint=pending_restoration_hint)
+                except Exception as e:
+                    print(f"{YELLOW}Ошибка: {e}{RESET}")
+                    continue
+                pending_restoration_hint = False
+                print(f"{BOLD}{GREEN}Agent:{RESET} {reply}\n")
+                announce_task_transitions(active_task, prev_state)
+                continue
+
+            # === обычный режим: stage prompt + (опционально) clarification ===
+            prev_state = active_task.state
+            try:
+                with Spinner("Думаю..."):
+                    reply = advance_task(active_task, user_input, params,
+                                         _current_profile_text, wm,
+                                         restoration_hint=pending_restoration_hint)
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else "?"
+                try:
+                    detail = e.response.json()
+                except Exception:
+                    detail = e.response.text if e.response is not None else ""
+                print(f"{YELLOW}Ошибка {status}: {detail}{RESET}")
+                continue
+            except requests.ConnectionError as e:
+                print(f"{YELLOW}Нет соединения: {e}{RESET}")
+                continue
+            except requests.Timeout:
+                print(f"{YELLOW}Таймаут — сервер не ответил вовремя{RESET}")
+                continue
+            except Exception as e:
+                print(f"{YELLOW}Ошибка: {e}{RESET}")
+                continue
+            pending_restoration_hint = False
+            print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
+            print()
+            announce_task_transitions(active_task, prev_state)
             continue
 
         # Краткосрочная память: добавляем сообщение пользователя
