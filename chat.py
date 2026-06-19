@@ -28,7 +28,8 @@ from domain.knowledge import sanitize_knowledge_name
 from infra.working_memory_repository import FileWorkingMemoryRepository
 from infra.session_repository import FileSessionRepository
 from infra.gigachat_client import RequestsGigaChatClient
-from app.ports import GigaChatClient
+from infra.task_repository import FileTaskRepository
+from app.ports import GigaChatClient, TaskRepository
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -469,92 +470,12 @@ def handle_know(cmd_str: str):
 # Идентификатор активной сессии живёт как локальная переменная в main().
 
 # ══════════════════════════════════════════════════════════════════════════════
-# СЛОЙ 4 — МАШИНА СОСТОЯНИЙ ЗАДАЧИ: персистентность поверх domain.Task
+# СЛОЙ 4 — МАШИНА СОСТОЯНИЙ ЗАДАЧИ
 # ══════════════════════════════════════════════════════════════════════════════
-# Чистая модель (данные, переходы, сериализация) живёт в domain.task.
-# Здесь — файловое хранилище и указатель активной задачи. По мере роста
-# слоя infra/ эти методы переедут в TaskRepository.
-class Task(_DomainTask):
-    """Задача с файловой персистентностью поверх доменной модели."""
+# Модель — domain.task.Task.
+# Хранилище и указатель активной задачи — infra.task_repository.FileTaskRepository.
 
-    def transition(self, new_state: str, reason: str = "", save: bool = True):
-        super().transition(new_state, reason=reason)
-        if save:
-            self.save()
-
-    # ── persistence ──────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _path(task_id: str) -> str:
-        return os.path.join(TASKS_DIR, f"{task_id}.json")
-
-    def save(self):
-        os.makedirs(TASKS_DIR, exist_ok=True)
-        self.updated_at = time.strftime("%Y-%m-%d %H:%M")
-        with open(self._path(self.id), "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load(cls, task_id: str) -> Optional["Task"]:
-        path = cls._path(task_id)
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, encoding="utf-8") as f:
-                return cls.from_dict(json.load(f))
-        except Exception:
-            return None
-
-    @classmethod
-    def list_all(cls) -> list:
-        if not os.path.isdir(TASKS_DIR):
-            return []
-        tasks = []
-        for fname in os.listdir(TASKS_DIR):
-            if not fname.endswith(".json"):
-                continue
-            t = cls.load(os.path.splitext(fname)[0])
-            if t is not None:
-                tasks.append(t)
-        tasks.sort(key=lambda t: t.updated_at or "", reverse=True)
-        return tasks
-
-    def delete(self):
-        path = self._path(self.id)
-        if os.path.exists(path):
-            os.remove(path)
-        if Task.get_active_id() == self.id:
-            Task.clear_active()
-
-    # ── active task pointer ──────────────────────────────────────────────────
-
-    def set_active(self):
-        os.makedirs(TASKS_DIR, exist_ok=True)
-        with open(ACTIVE_TASK_FILE, "w", encoding="utf-8") as f:
-            f.write(self.id)
-
-    @staticmethod
-    def get_active_id() -> Optional[str]:
-        if not os.path.exists(ACTIVE_TASK_FILE):
-            return None
-        try:
-            with open(ACTIVE_TASK_FILE, encoding="utf-8") as f:
-                tid = f.read().strip()
-            return tid or None
-        except Exception:
-            return None
-
-    @classmethod
-    def get_active(cls) -> Optional["Task"]:
-        tid = cls.get_active_id()
-        if not tid:
-            return None
-        return cls.load(tid)
-
-    @staticmethod
-    def clear_active():
-        if os.path.exists(ACTIVE_TASK_FILE):
-            os.remove(ACTIVE_TASK_FILE)
+Task = _DomainTask  # переходный алиас: убрать при переезде вызовов
 
 
 # ── Stage prompts + driver ────────────────────────────────────────────────────
@@ -704,6 +625,7 @@ def advance_task(task: Task,
                  profile_text: Optional[str],
                  wm: "WorkingMemory",
                  client: GigaChatClient,
+                 task_repo: TaskRepository,
                  restoration_hint: bool = False) -> str:
     """Один прогон текущей стадии через модель.
 
@@ -733,7 +655,7 @@ def advance_task(task: Task,
         })
         task.pending_questions = []
         task.awaiting = None
-        task.save()
+        task_repo.save(task)
         # user_input уже впитан в answers и попадёт в task_block — не дублируем
         # его как отдельное user-message, чтобы модель не отвечала на ответ как
         # на новый вопрос.
@@ -746,7 +668,7 @@ def advance_task(task: Task,
         stage_obj.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
     stage_obj.status = StageStatus.IN_PROGRESS
     task.stages[task.state] = stage_obj
-    task.save()
+    task_repo.save(task)
 
     base = build_system_prompt(profile_text, wm) or ""
     task_block = build_task_block(task, restoration_hint=restoration_hint)
@@ -760,7 +682,7 @@ def advance_task(task: Task,
         reply = client.chat(stage_messages, params, system_prompt)
     except Exception:
         stage_obj.status = StageStatus.FAILED
-        task.save()
+        task_repo.save(task)
         raise
 
     # Накапливаем вывод стадии (важно при многошаговых итерациях).
@@ -773,7 +695,7 @@ def advance_task(task: Task,
         task.awaiting = "clarification"
         stage_obj.status = StageStatus.AWAITING_USER
         task.stages[task.state] = stage_obj
-        task.save()
+        task_repo.save(task)
         return reply
 
     if task.state == TaskState.PLANNING:
@@ -783,7 +705,7 @@ def advance_task(task: Task,
         task.awaiting = "plan_approval"
         stage_obj.status = StageStatus.AWAITING_USER
         task.stages[task.state] = stage_obj
-        task.save()
+        task_repo.save(task)
         return reply
 
     # Стадия отработала без вопросов — закрываем её.
@@ -792,22 +714,22 @@ def advance_task(task: Task,
     stage_obj.status = StageStatus.DONE
     stage_obj.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
     task.stages[task.state] = stage_obj
-    task.save()
+    task_repo.save(task)
 
     # Стадия intake: ответ без [QUESTION] означает, что модель готова планировать.
     # Без автоперехода задача залипает в intake и следующее сообщение пользователя
     # снова запускает intake-промпт, который снова просит уточнений — отсюда петля
     # и повторы одних и тех же вопросов.
     if task.state == TaskState.INTAKE:
-        task.transition(TaskState.PLANNING, reason="уточнения собраны, переходим к плану")
+        task_repo.transition(task, TaskState.PLANNING, reason="уточнения собраны, переходим к плану")
 
     # Стадия validation: автоматический переход по вердикту модели.
     if task.state == TaskState.VALIDATION:
         verdict = parse_validation_verdict(reply)
         if verdict == "ok":
-            task.transition(TaskState.DONE, reason="валидация пройдена")
+            task_repo.transition(task, TaskState.DONE, reason="валидация пройдена")
         elif verdict == "issues":
-            task.transition(TaskState.EXECUTION, reason="валидация выявила проблемы")
+            task_repo.transition(task, TaskState.EXECUTION, reason="валидация выявила проблемы")
         # verdict == None — оставляем validation done, пользователь решит руками.
 
     return reply
@@ -831,7 +753,7 @@ _YES = {"y", "yes", "да", "д"}
 _NO  = {"n", "no", "нет", "н"}
 
 
-def handle_plan_approval(task: Task, user_input: str) -> str:
+def handle_plan_approval(task: Task, user_input: str, task_repo: TaskRepository) -> str:
     """Обработать y/n на запрос утверждения плана.
 
     Только мутирует task. UI и запуск execution делает main(), чтобы здесь
@@ -847,16 +769,16 @@ def handle_plan_approval(task: Task, user_input: str) -> str:
             st.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
             task.stages[TaskState.PLANNING] = st
         task.awaiting = None
-        task.transition(TaskState.EXECUTION, reason="план утверждён пользователем")
+        task_repo.transition(task, TaskState.EXECUTION, reason="план утверждён пользователем")
         return PLAN_APPROVAL_APPROVED
     if ans in _NO:
         task.awaiting = "plan_revision_input"
-        task.save()
+        task_repo.save(task)
         return PLAN_APPROVAL_REJECTED
     return PLAN_APPROVAL_RETRY
 
 
-def handle_plan_revision(task: Task, user_input: str) -> None:
+def handle_plan_revision(task: Task, user_input: str, task_repo: TaskRepository) -> None:
     """Зафиксировать правки от пользователя и подготовить planning к перегенерации.
 
     Старый план уходит в stages[planning].artifacts["revisions"], output чистится,
@@ -888,7 +810,7 @@ def handle_plan_revision(task: Task, user_input: str) -> None:
         "at":    now,
     })
     task.awaiting = None
-    task.save()
+    task_repo.save(task)
 
 
 def announce_task_transitions(task: Task, prev_state: str) -> None:
@@ -960,7 +882,8 @@ def handle_task(cmd_str: str,
                 params: dict,
                 profile_text: Optional[str],
                 wm: "WorkingMemory",
-                client: GigaChatClient) -> None:
+                client: GigaChatClient,
+                task_repo: TaskRepository) -> None:
     """Обработка /task <sub> ..."""
     parts = cmd_str.split(None, 2)
     sub = parts[1].lower() if len(parts) > 1 else "show"
@@ -975,7 +898,7 @@ def handle_task(cmd_str: str,
         if not request:
             print(f"{YELLOW}  Пустой запрос — задача не создана.{RESET}")
             return
-        active = Task.get_active()
+        active = task_repo.get_active()
         if active and not active.is_terminal():
             print(f"{YELLOW}  Уже есть активная задача #{active.id} ({active.state}). "
                   f"Сначала /task abort или /task done.{RESET}")
@@ -983,18 +906,18 @@ def handle_task(cmd_str: str,
         # Если active указывает на терминальную задачу — расчищаем перед стартом
         # новой, чтобы дашборд не висел в неопределённом виде.
         if active and active.is_terminal():
-            Task.clear_active()
+            task_repo.clear_active()
         task = Task.new(
             request,
             profile=profile_name(_current_profile_path) if _current_profile_path else None,
             model=params["model"],
         )
-        task.save()
-        task.set_active()
+        task_repo.save(task)
+        task_repo.set_active(task)
         print(f"{GREEN}  Создана задача #{task.id} (стадия: {task.state}).{RESET}")
         try:
             with Spinner("Думаю..."):
-                reply = advance_task(task, request, params, profile_text, wm, client)
+                reply = advance_task(task, request, params, profile_text, wm, client, task_repo)
         except Exception as e:
             print(f"{YELLOW}  Ошибка стадии: {e}{RESET}")
             return
@@ -1002,7 +925,7 @@ def handle_task(cmd_str: str,
         return
 
     if sub in ("show", ""):
-        task = Task.get_active()
+        task = task_repo.get_active()
         if not task:
             print(f"{DIM}  Активной задачи нет.{RESET}")
             return
@@ -1010,11 +933,11 @@ def handle_task(cmd_str: str,
         return
 
     if sub == "list":
-        tasks = Task.list_all()
+        tasks = task_repo.list_all()
         if not tasks:
             print(f"{DIM}  Задач нет.{RESET}")
             return
-        active_id = Task.get_active_id()
+        active_id = task_repo.get_active_id()
         print(f"\n{BOLD}Задачи:{RESET}")
         for t in tasks:
             mark = f" {YELLOW}◀ активная{RESET}" if t.id == active_id else ""
@@ -1029,17 +952,17 @@ def handle_task(cmd_str: str,
         if not tid:
             print(f"{YELLOW}  Использование: /task resume <id>{RESET}")
             return
-        t = Task.load(tid)
+        t = task_repo.load(tid)
         if not t:
             print(f"{YELLOW}  Задача #{tid} не найдена.{RESET}")
             return
-        t.set_active()
+        task_repo.set_active(t)
         print(f"{GREEN}  Активной выбрана #{t.id} (стадия: {t.state}).{RESET}")
         show_task(t)
         return
 
     if sub == "advance":
-        task = Task.get_active()
+        task = task_repo.get_active()
         if not task:
             print(f"{YELLOW}  Активной задачи нет.{RESET}")
             return
@@ -1049,7 +972,7 @@ def handle_task(cmd_str: str,
             return
         reason = parts[2].strip() if len(parts) > 2 else "ручной переход вперёд"
         try:
-            task.transition(nxt, reason=reason)
+            task_repo.transition(task, nxt, reason=reason)
         except TaskTransitionError as e:
             print(f"{YELLOW}  {e}{RESET}")
             return
@@ -1057,7 +980,7 @@ def handle_task(cmd_str: str,
         return
 
     if sub == "back":
-        task = Task.get_active()
+        task = task_repo.get_active()
         if not task:
             print(f"{YELLOW}  Активной задачи нет.{RESET}")
             return
@@ -1066,7 +989,7 @@ def handle_task(cmd_str: str,
             print(f"{YELLOW}  Использование: /task back <стадия>{RESET}")
             return
         try:
-            task.transition(target, reason="ручной откат")
+            task_repo.transition(task, target, reason="ручной откат")
         except TaskTransitionError as e:
             print(f"{YELLOW}  {e}{RESET}")
             return
@@ -1074,31 +997,31 @@ def handle_task(cmd_str: str,
         return
 
     if sub == "abort":
-        task = Task.get_active()
+        task = task_repo.get_active()
         if not task:
             print(f"{YELLOW}  Активной задачи нет.{RESET}")
             return
         reason = parts[2].strip() if len(parts) > 2 else "пользователь отменил"
         try:
-            task.transition(TaskState.ABORTED, reason=reason)
+            task_repo.transition(task, TaskState.ABORTED, reason=reason)
         except TaskTransitionError as e:
             print(f"{YELLOW}  {e}{RESET}")
             return
-        Task.clear_active()
+        task_repo.clear_active()
         print(f"{DIM}  Задача #{task.id} отменена.{RESET}")
         return
 
     if sub == "done":
-        task = Task.get_active()
+        task = task_repo.get_active()
         if not task:
             print(f"{YELLOW}  Активной задачи нет.{RESET}")
             return
         try:
-            task.transition(TaskState.DONE, reason="вручную завершено")
+            task_repo.transition(task, TaskState.DONE, reason="вручную завершено")
         except TaskTransitionError as e:
             print(f"{YELLOW}  {e}{RESET}")
             return
-        Task.clear_active()
+        task_repo.clear_active()
         print(f"{GREEN}  Задача #{task.id} завершена.{RESET}")
         return
 
@@ -1107,13 +1030,13 @@ def handle_task(cmd_str: str,
         if not tid:
             print(f"{YELLOW}  Использование: /task delete <id>{RESET}")
             return
-        t = Task.load(tid)
+        t = task_repo.load(tid)
         if not t:
             # Файл задачи мог отсутствовать (никогда не сохранялась), но active
             # pointer всё ещё может на неё указывать — почистим, чтобы дашборд
             # не показывал «призрак».
-            if Task.get_active_id() == tid:
-                Task.clear_active()
+            if task_repo.get_active_id() == tid:
+                task_repo.clear_active()
                 print(f"{YELLOW}  Задача #{tid} не найдена на диске; active-указатель очищен.{RESET}")
             else:
                 print(f"{YELLOW}  Задача #{tid} не найдена.{RESET}")
@@ -1125,13 +1048,13 @@ def handle_task(cmd_str: str,
         if confirm not in _YES:
             print(f"{DIM}  Отменено.{RESET}")
             return
-        t.delete()  # сама подчистит active pointer если нужно
+        task_repo.delete(t)  # сам подчистит active pointer если нужно
         print(f"{GREEN}  Задача #{tid} удалена.{RESET}")
         return
 
     if sub == "log":
         tid = parts[2].strip() if len(parts) > 2 else ""
-        task = Task.load(tid) if tid else Task.get_active()
+        task = task_repo.load(tid) if tid else task_repo.get_active()
         if not task:
             print(f"{YELLOW}  {'Задача не найдена.' if tid else 'Активной задачи нет.'}{RESET}")
             return
@@ -1182,9 +1105,9 @@ def print_settings(params: dict):
     pname = profile_name(_current_profile_path) if _current_profile_path else "нет"
     print(f"{DIM}  модель: {params['model']}  temperature: {temp}  max_tokens: {maxt}  профиль: {pname}{RESET}")
 
-def _task_status_badge() -> str:
+def _task_status_badge(task_repo: TaskRepository) -> str:
     """Однострочный индикатор активной задачи для общего дашборда."""
-    task = Task.get_active()
+    task = task_repo.get_active()
     if not task or task.is_terminal():
         return f"{DIM}задача: —{RESET}"
     short = task.title[:30] + ("…" if len(task.title) > 30 else "")
@@ -1199,7 +1122,7 @@ def _task_status_badge() -> str:
     return f"{YELLOW}задача: #{task.id} {task.state} · {short}{suffix}{RESET}"
 
 
-def print_memory_status(messages: list, wm: WorkingMemory):
+def print_memory_status(messages: list, wm: WorkingMemory, task_repo: TaskRepository):
     """Однострочный дашборд всех слоёв памяти + активная задача."""
     # краткосрочная
     st_label = f"{GREEN}краткосрочная: {len(messages)} сообщ.{RESET}" if messages \
@@ -1214,14 +1137,15 @@ def print_memory_status(messages: list, wm: WorkingMemory):
         lt_label += f", {len(kfiles)} знаний"
     lt_label += RESET
     # задача
-    task_label = _task_status_badge()
+    task_label = _task_status_badge(task_repo)
 
     print(f"  {st_label}  │  {wm_label}  │  {lt_label}  │  {task_label}")
 
 def print_mem_detail(messages: list,
                      wm: WorkingMemory,
                      session_id: Optional[str],
-                     session_repo: FileSessionRepository):
+                     session_repo: FileSessionRepository,
+                     task_repo: TaskRepository):
     """Подробный вывод всех трёх слоёв."""
     print(f"\n{BOLD}═══ Модель памяти ═══{RESET}\n")
 
@@ -1255,14 +1179,14 @@ def print_mem_detail(messages: list,
 
     # Слой 4
     print(f"\n{BOLD}{YELLOW}[4] Задача{RESET}  {DIM}(машина состояний){RESET}")
-    active = Task.get_active()
+    active = task_repo.get_active()
     if active and not active.is_terminal():
         print(f"    Активная: #{active.id} «{active.title}» (стадия: {active.state})")
         if active.awaiting:
             print(f"    {YELLOW}Ожидание ввода:{RESET} {active.awaiting}")
     else:
         print(f"    {DIM}Активной задачи нет.{RESET}")
-    all_tasks = Task.list_all()
+    all_tasks = task_repo.list_all()
     if all_tasks:
         nonterm = sum(1 for t in all_tasks if not t.is_terminal())
         done    = sum(1 for t in all_tasks if t.state == TaskState.DONE)
@@ -1361,6 +1285,7 @@ def main():
     # Composition root: собираем инфраструктурные зависимости.
     wm_repo      = FileWorkingMemoryRepository(os.path.join(WORKING_DIR, "current.json"))
     session_repo = FileSessionRepository(HISTORY_DIR, MAX_SESSIONS)
+    task_repo    = FileTaskRepository(TASKS_DIR, ACTIVE_TASK_FILE)
     client       = RequestsGigaChatClient(
         auth_key  = AUTH_KEY,
         oauth_url = OAUTH_URL,
@@ -1410,7 +1335,7 @@ def main():
 
     # Восстановление активной задачи (Слой 4): спрашиваем пользователя, продолжать ли.
     pending_restoration_hint = False
-    saved_active = Task.get_active()
+    saved_active = task_repo.get_active()
     if saved_active and not saved_active.is_terminal():
         print(f"{BOLD}{MAGENTA}Найдена активная задача:{RESET}")
         show_task(saved_active)
@@ -1428,11 +1353,11 @@ def main():
                 print(f"{DIM}  Задача ждёт ответа на уточняющие вопросы (см. выше).{RESET}")
             print(f"{GREEN}  Возобновляем.{RESET}\n")
         else:
-            Task.clear_active()
+            task_repo.clear_active()
             print(f"{DIM}  Задача #{saved_active.id} оставлена в /task list (но не активна).{RESET}\n")
 
     print_settings(params)
-    print_memory_status(messages, wm)
+    print_memory_status(messages, wm, task_repo)
     print()
 
     while True:
@@ -1459,15 +1384,15 @@ def main():
                 set_max_tokens(params)
             elif cmd == "/settings":
                 print_settings(params)
-                print_memory_status(messages, wm)
+                print_memory_status(messages, wm, task_repo)
             elif cmd == "/mem":
-                print_mem_detail(messages, wm, current_session_id, session_repo)
+                print_mem_detail(messages, wm, current_session_id, session_repo, task_repo)
             elif cmd.startswith("/wm"):
                 handle_wm(user_input, wm, wm_repo)
             elif cmd.startswith("/know"):
                 handle_know(user_input)
             elif cmd.startswith("/task"):
-                handle_task(user_input, params, _current_profile_text, wm, client)
+                handle_task(user_input, params, _current_profile_text, wm, client, task_repo)
             elif cmd == "/profile new":
                 _current_profile_path, _current_profile_text = create_profile()
             elif cmd == "/profile edit":
@@ -1491,12 +1416,12 @@ def main():
         # Если есть активная нетерминальная задача — ввод идёт в её драйвер,
         # а не в обычный чат. Сначала проверяем спец-режимы (plan_approval,
         # plan_revision_input), потом обычный clarification/stage цикл.
-        active_task = Task.get_active()
+        active_task = task_repo.get_active()
         if active_task and not active_task.is_terminal():
 
             # === шлюз утверждения плана ===
             if active_task.awaiting == "plan_approval":
-                result = handle_plan_approval(active_task, user_input)
+                result = handle_plan_approval(active_task, user_input, task_repo)
                 if result == PLAN_APPROVAL_RETRY:
                     print(f"{YELLOW}  Ответь «y» (одобрить) или «n» (нужны правки).{RESET}")
                     continue
@@ -1510,7 +1435,7 @@ def main():
                 try:
                     with Spinner("Думаю..."):
                         reply = advance_task(active_task, "", params,
-                                             _current_profile_text, wm, client,
+                                             _current_profile_text, wm, client, task_repo,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -1523,7 +1448,7 @@ def main():
             # === пользователь ответил на «что поправить?» ===
             if active_task.awaiting == "plan_revision_input":
                 try:
-                    handle_plan_revision(active_task, user_input)
+                    handle_plan_revision(active_task, user_input, task_repo)
                 except RuntimeError as e:
                     print(f"{YELLOW}  {e}{RESET}")
                     continue
@@ -1532,7 +1457,7 @@ def main():
                 try:
                     with Spinner("Перепланирую..."):
                         reply = advance_task(active_task, "", params,
-                                             _current_profile_text, wm, client,
+                                             _current_profile_text, wm, client, task_repo,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -1547,7 +1472,7 @@ def main():
             try:
                 with Spinner("Думаю..."):
                     reply = advance_task(active_task, user_input, params,
-                                         _current_profile_text, wm, client,
+                                         _current_profile_text, wm, client, task_repo,
                                          restoration_hint=pending_restoration_hint)
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"

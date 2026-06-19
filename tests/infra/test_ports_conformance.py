@@ -6,9 +6,15 @@ isinstance с Protocol работает только с runtime_checkable, по�
 """
 import inspect
 
-from app.ports import GigaChatClient, SessionRepository, WorkingMemoryRepository
+from app.ports import (
+    GigaChatClient,
+    SessionRepository,
+    TaskRepository,
+    WorkingMemoryRepository,
+)
 from infra.gigachat_client import RequestsGigaChatClient
 from infra.session_repository import FileSessionRepository
+from infra.task_repository import FileTaskRepository
 from infra.working_memory_repository import FileWorkingMemoryRepository
 
 
@@ -38,3 +44,9 @@ def test_requests_gigachat_client_covers_port():
     )
     for name in _methods(GigaChatClient):
         assert callable(getattr(client, name)), f"missing method: {name}"
+
+
+def test_file_task_repository_covers_port(tmp_path):
+    repo = FileTaskRepository(dir_path=str(tmp_path / "tasks"))
+    for name in _methods(TaskRepository):
+        assert callable(getattr(repo, name)), f"missing method: {name}"
