@@ -50,5 +50,6 @@ PROFILES_DIR     = os.path.expanduser("~/.jarvis/profiles")
 WORKING_DIR      = os.path.expanduser("~/.jarvis/working")
 KNOWLEDGE_DIR    = os.path.expanduser("~/.jarvis/knowledge")
 TASKS_DIR        = os.path.expanduser("~/.jarvis/tasks")
+INVARIANTS_DIR   = os.path.expanduser("~/.jarvis/invariants")
 ACTIVE_TASK_FILE = os.path.join(TASKS_DIR, "active")
 MAX_SESSIONS     = 20

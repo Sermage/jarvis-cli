@@ -13,6 +13,7 @@ from typing import Optional
 
 import requests
 
+from app.invariant_guard import guarded_chat
 from app.system_prompt import build_system_prompt
 from app.task_driver import (
     PLAN_APPROVAL_REJECTED,
@@ -27,6 +28,7 @@ from cli.config import (
     CHAT_URL,
     DEFAULT_PARAMS,
     HISTORY_DIR,
+    INVARIANTS_DIR,
     KNOWLEDGE_DIR,
     MAX_SESSIONS,
     OAUTH_URL,
@@ -36,6 +38,7 @@ from cli.config import (
     WORKING_DIR,
     load_env,
 )
+from cli.invariant_commands import handle_inv
 from cli.know_commands import handle_know
 from cli.profile_commands import (
     choose_profile,
@@ -47,6 +50,7 @@ from cli.settings_commands import choose_model, set_max_tokens, set_temperature
 from cli.spinner import Spinner
 from cli.task_commands import handle_task
 from cli.views import (
+    announce_guard_result,
     announce_task_transitions,
     print_help,
     print_mem_detail,
@@ -58,6 +62,7 @@ from cli.views import (
 from cli.wm_commands import handle_wm
 from domain.profile import Profile
 from infra.gigachat_client import RequestsGigaChatClient
+from infra.invariant_repository import FileInvariantRepository
 from infra.knowledge_repository import FileKnowledgeRepository
 from infra.profile_repository import FileProfileRepository
 from infra.session_repository import FileSessionRepository
@@ -85,6 +90,7 @@ def main():
     task_repo      = FileTaskRepository(TASKS_DIR, ACTIVE_TASK_FILE)
     profile_repo   = FileProfileRepository(PROFILES_DIR)
     knowledge_repo = FileKnowledgeRepository(KNOWLEDGE_DIR)
+    invariant_repo = FileInvariantRepository(INVARIANTS_DIR)
     client         = RequestsGigaChatClient(
         auth_key  = auth_key,
         oauth_url = OAUTH_URL,
@@ -191,7 +197,9 @@ def main():
                 handle_know(user_input, knowledge_repo)
             elif cmd.startswith("/task"):
                 handle_task(user_input, params, current_profile, wm,
-                            client, task_repo, knowledge_repo)
+                            client, task_repo, knowledge_repo, invariant_repo)
+            elif cmd.startswith("/inv"):
+                handle_inv(user_input, invariant_repo)
             elif cmd == "/profile new":
                 current_profile = create_profile(profile_repo, current_profile)
             elif cmd == "/profile edit":
@@ -236,6 +244,7 @@ def main():
                         reply = advance_task(active_task, "", params,
                                              current_profile.content if current_profile else None,
                                              wm, client, task_repo, knowledge_repo,
+                                             invariant_repo=invariant_repo,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -259,6 +268,7 @@ def main():
                         reply = advance_task(active_task, "", params,
                                              current_profile.content if current_profile else None,
                                              wm, client, task_repo, knowledge_repo,
+                                             invariant_repo=invariant_repo,
                                              restoration_hint=pending_restoration_hint)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
@@ -275,6 +285,7 @@ def main():
                     reply = advance_task(active_task, user_input, params,
                                          current_profile.content if current_profile else None,
                                          wm, client, task_repo, knowledge_repo,
+                                         invariant_repo=invariant_repo,
                                          restoration_hint=pending_restoration_hint)
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
@@ -302,16 +313,18 @@ def main():
         # Краткосрочная память: добавляем сообщение пользователя
         messages.append({"role": "user", "content": user_input})
 
-        # Формируем system prompt из долговременной + рабочей памяти
+        # Формируем system prompt из долговременной + рабочей памяти + инвариантов
         system_prompt = build_system_prompt(
             current_profile.content if current_profile else None,
             wm,
             knowledge_repo,
+            invariant_repo,
         )
 
         try:
             with Spinner("Думаю..."):
-                reply = client.chat(messages, params, system_prompt)
+                guarded = guarded_chat(client, messages, params, system_prompt,
+                                       invariant_repo.load_all(), max_retries=1)
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
             try:
@@ -334,7 +347,9 @@ def main():
             messages.pop()
             continue
 
+        reply = guarded.reply
         print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
+        announce_guard_result(guarded)
 
         # Краткосрочная память: сохраняем ответ ассистента
         messages.append({"role": "assistant", "content": reply})

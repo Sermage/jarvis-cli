@@ -4,10 +4,17 @@ from __future__ import annotations
 import time
 from typing import Callable, Optional
 
+from app.invariant_guard import GuardedResult, guarded_chat
 from app.parsers import parse_questions, parse_validation_verdict
-from app.ports import GigaChatClient, KnowledgeRepository, TaskRepository
+from app.ports import (
+    GigaChatClient,
+    InvariantRepository,
+    KnowledgeRepository,
+    TaskRepository,
+)
 from app.stage_prompts import STAGE_PROMPTS, build_task_block
 from app.system_prompt import build_system_prompt
+from domain.invariant import InvariantSet
 from domain.task import StageResult, StageStatus, Task, TaskState
 from domain.working_memory import WorkingMemory
 
@@ -25,6 +32,33 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _record_violations(stage_obj: StageResult,
+                       guarded: GuardedResult,
+                       now: str) -> None:
+    """Залогировать нарушения инвариантов в artifacts стадии.
+
+    Сами тексты ответов модели тут не дублируются — они уходят в `output`.
+    Это след для отладки: что было нарушено, сколько раз перегенерировали.
+    """
+    if not guarded.violations and not guarded.blocked:
+        return
+    entries = stage_obj.artifacts.setdefault("invariant_violations", [])
+    entries.append({
+        "at":           now,
+        "blocked":      guarded.blocked,
+        "retries_used": guarded.retries_used,
+        "violations": [
+            {
+                "id":       v.invariant_id,
+                "title":    v.title,
+                "severity": v.severity.value,
+                "reason":   v.reason,
+            }
+            for v in guarded.violations
+        ],
+    })
+
+
 def advance_task(task: Task,
                  user_input: str,
                  params: dict,
@@ -33,6 +67,7 @@ def advance_task(task: Task,
                  client: GigaChatClient,
                  task_repo: TaskRepository,
                  knowledge_repo: KnowledgeRepository,
+                 invariant_repo: Optional[InvariantRepository] = None,
                  restoration_hint: bool = False,
                  now: Callable[[], str] = _now) -> str:
     """Один прогон текущей стадии через модель.
@@ -78,7 +113,7 @@ def advance_task(task: Task,
     task.stages[task.state] = stage_obj
     task_repo.save(task)
 
-    base = build_system_prompt(profile_text, wm, knowledge_repo) or ""
+    base = build_system_prompt(profile_text, wm, knowledge_repo, invariant_repo) or ""
     task_block = build_task_block(task, restoration_hint=restoration_hint)
     system_prompt = (base + "\n\n" + task_block) if base else task_block
 
@@ -86,12 +121,16 @@ def advance_task(task: Task,
     if followup_message:
         stage_messages.append({"role": "user", "content": followup_message})
 
+    invariants = invariant_repo.load_all() if invariant_repo is not None else InvariantSet()
     try:
-        reply = client.chat(stage_messages, params, system_prompt)
+        guarded = guarded_chat(client, stage_messages, params, system_prompt,
+                               invariants, max_retries=1)
     except Exception:
         stage_obj.status = StageStatus.FAILED
         task_repo.save(task)
         raise
+    reply = guarded.reply
+    _record_violations(stage_obj, guarded, now=now())
 
     # Накапливаем вывод стадии (важно при многошаговых итерациях).
     stage_obj.output = (stage_obj.output + "\n\n" + reply).strip() if stage_obj.output else reply

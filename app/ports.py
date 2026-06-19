@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Optional, Protocol
 
+from domain.invariant import Invariant, InvariantSet
 from domain.knowledge import KnowledgeEntry
 from domain.profile import Profile
 from domain.task import Task
@@ -95,4 +96,24 @@ class KnowledgeRepository(Protocol):
     def save(self, entry: KnowledgeEntry) -> None: ...
     def all_as_prompt(self) -> str:
         """Склейка всех записей для system prompt."""
+        ...
+
+
+class InvariantRepository(Protocol):
+    """Хранилище инвариантов — нерушимых ограничений проекта.
+
+    Инварианты хранятся отдельно от диалога и подгружаются в каждый
+    system prompt, чтобы ассистент не мог их случайно нарушить.
+    """
+
+    def list_ids(self) -> list[str]: ...
+    def load(self, invariant_id: str) -> Optional[Invariant]: ...
+    def save(self, inv: Invariant) -> None: ...
+    def delete(self, invariant_id: str) -> None: ...
+    def exists(self, invariant_id: str) -> bool: ...
+    def load_all(self) -> InvariantSet:
+        """Все инварианты единым набором — то, что уходит в prompt."""
+        ...
+    def path_for(self, invariant_id: str) -> str:
+        """Путь к файлу — нужен для запуска внешнего редактора."""
         ...

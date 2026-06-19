@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from app.ports import GigaChatClient, KnowledgeRepository, TaskRepository
+from app.ports import (
+    GigaChatClient,
+    InvariantRepository,
+    KnowledgeRepository,
+    TaskRepository,
+)
 from app.stage_prompts import next_forward_state
 from app.task_driver import advance_task
 from cli.ansi import BOLD, CYAN, DIM, GREEN, RESET, YELLOW
@@ -23,7 +28,8 @@ def handle_task(cmd_str: str,
                 wm: WorkingMemory,
                 client: GigaChatClient,
                 task_repo: TaskRepository,
-                knowledge_repo: KnowledgeRepository) -> None:
+                knowledge_repo: KnowledgeRepository,
+                invariant_repo: Optional[InvariantRepository] = None) -> None:
     """Обработка /task <sub> ..."""
     parts = cmd_str.split(None, 2)
     sub = parts[1].lower() if len(parts) > 1 else "show"
@@ -59,7 +65,8 @@ def handle_task(cmd_str: str,
         try:
             with Spinner("Думаю..."):
                 reply = advance_task(task, request, params, profile_text, wm,
-                                     client, task_repo, knowledge_repo)
+                                     client, task_repo, knowledge_repo,
+                                     invariant_repo=invariant_repo)
         except Exception as e:
             print(f"{YELLOW}  Ошибка стадии: {e}{RESET}")
             return
