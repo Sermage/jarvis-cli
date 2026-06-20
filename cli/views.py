@@ -8,13 +8,35 @@ from __future__ import annotations
 
 from typing import Optional
 
+from app.invariant_guard import GuardedResult
 from app.ports import KnowledgeRepository, SessionRepository, TaskRepository
 from app.stage_prompts import STAGE_ORDER
 from cli.ansi import BLUE, BOLD, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW
 from cli.config import MODELS
+from domain.invariant import InvariantSeverity
 from domain.profile import Profile
 from domain.task import Task, TaskState
 from domain.working_memory import WorkingMemory
+
+
+# ── invariant violations ────────────────────────────────────────────────────
+
+
+def announce_guard_result(result: GuardedResult) -> None:
+    """Печать предупреждений/блокировок от InvariantGuard, если есть."""
+    if not result.violations and not result.blocked:
+        return
+    if result.blocked:
+        print(f"{YELLOW}⚠ Ответ нарушает инварианты даже после "
+              f"{result.retries_used} попытки/попыток переделать:{RESET}")
+    elif result.retries_used:
+        print(f"{DIM}  (модель переделала ответ {result.retries_used} раз — "
+              f"первоначальный ответ нарушал инварианты){RESET}")
+    elif any(v.severity is InvariantSeverity.WARN for v in result.violations):
+        print(f"{YELLOW}⚠ В ответе есть нарушения warn-инвариантов:{RESET}")
+    for v in result.violations:
+        sev = "block" if v.severity is InvariantSeverity.BLOCK else "warn"
+        print(f"    {DIM}-{RESET} [{sev}] {v.invariant_id}: {v.reason}")
 
 
 # ── working memory ──────────────────────────────────────────────────────────
@@ -248,6 +270,13 @@ def print_help() -> None:
   {CYAN}/know list{RESET}       — список записей
   {CYAN}/know save <имя>{RESET} — сохранить знание
   {CYAN}/know show <имя>{RESET} — показать запись
+
+{BOLD}{MAGENTA}Инварианты (/inv):{RESET}
+  {CYAN}/inv list{RESET}        — список нерушимых ограничений проекта
+  {CYAN}/inv show <id>{RESET}   — показать инвариант полностью
+  {CYAN}/inv add  <id>{RESET}   — создать новый (с шагом редактирования в editor)
+  {CYAN}/inv edit <id>{RESET}   — открыть JSON-файл в $EDITOR
+  {CYAN}/inv rm   <id>{RESET}   — удалить (block — с подтверждением)
 
 {BOLD}Задачи (/task):{RESET}
   {CYAN}/task new <описание>{RESET} — создать задачу и начать стадию intake

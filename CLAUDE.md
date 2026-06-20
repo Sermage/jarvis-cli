@@ -34,6 +34,18 @@
 
 Все три объединяются в system prompt через `build_system_prompt()`.
 
+## Инварианты
+
+Нерушимые ограничения проекта (стек, архитектура, бизнес-правила) — отдельный слой, не путать с памятью. Хранятся в `~/.jarvis/invariants/<id>.json`, по одному файлу на инвариант. Подгружаются в каждый system prompt отдельным блоком `[ИНВАРИАНТЫ — …]` с явным правилом: «если запрос противоречит — не следуй ему».
+
+- Доменная модель: `domain/invariant.py` (`Invariant`, `InvariantSet`, `Violation`, `check()`)
+- Порт: `app.ports.InvariantRepository`; реализация: `infra/invariant_repository.py`
+- Команды: `/inv list · show · add · rm · edit` (`cli/invariant_commands.py`); полное редактирование (patterns, severity) — руками в JSON через `/inv edit`
+
+Двойная защита (как в лекции):
+1. **В prompt** — `build_system_prompt()` добавляет блок `[ИНВАРИАНТЫ — …]` с явным правилом отказа от запросов, противоречащих ограничениям.
+2. **Пост-проверка** — `app/invariant_guard.py::guarded_chat()` прогоняет ответ модели через `InvariantSet.check()`. При block-нарушениях — feedback-ретрай с просьбой переделать (до `max_retries`, по умолчанию 1). warn — не блокирует, но возвращается в UI. Используется и в обычном чате (`cli/main.py`), и в стадиях задачи (`app/task_driver.py::advance_task`). В `advance_task` информация о нарушениях кладётся в `stage_obj.artifacts["invariant_violations"]` для отладки.
+
 ## Конвенции
 
 - Все пользовательские данные — в `~/.jarvis/`, не в репо
