@@ -14,6 +14,7 @@ from typing import Optional
 import requests
 
 from app.invariant_guard import guarded_chat
+from app.orchestrator import build_default_orchestrator
 from app.system_prompt import build_system_prompt
 from app.task_driver import (
     PLAN_APPROVAL_REJECTED,
@@ -97,6 +98,7 @@ def main():
         chat_url  = CHAT_URL,
         scope     = SCOPE,
     )
+    orchestrator   = build_default_orchestrator(task_repo)
 
     print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}\n")
 
@@ -197,7 +199,8 @@ def main():
                 handle_know(user_input, knowledge_repo)
             elif cmd.startswith("/task"):
                 handle_task(user_input, params, current_profile, wm,
-                            client, task_repo, knowledge_repo, invariant_repo)
+                            client, task_repo, knowledge_repo, invariant_repo,
+                            orchestrator=orchestrator)
             elif cmd.startswith("/inv"):
                 handle_inv(user_input, invariant_repo)
             elif cmd == "/profile new":
@@ -245,7 +248,8 @@ def main():
                                              current_profile.content if current_profile else None,
                                              wm, client, task_repo, knowledge_repo,
                                              invariant_repo=invariant_repo,
-                                             restoration_hint=pending_restoration_hint)
+                                             restoration_hint=pending_restoration_hint,
+                                             orchestrator=orchestrator)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
                     continue
@@ -269,7 +273,8 @@ def main():
                                              current_profile.content if current_profile else None,
                                              wm, client, task_repo, knowledge_repo,
                                              invariant_repo=invariant_repo,
-                                             restoration_hint=pending_restoration_hint)
+                                             restoration_hint=pending_restoration_hint,
+                                             orchestrator=orchestrator)
                 except Exception as e:
                     print(f"{YELLOW}Ошибка: {e}{RESET}")
                     continue
@@ -286,7 +291,8 @@ def main():
                                          current_profile.content if current_profile else None,
                                          wm, client, task_repo, knowledge_repo,
                                          invariant_repo=invariant_repo,
-                                         restoration_hint=pending_restoration_hint)
+                                         restoration_hint=pending_restoration_hint,
+                                         orchestrator=orchestrator)
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
                 try:

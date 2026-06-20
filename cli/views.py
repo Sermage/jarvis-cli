@@ -92,6 +92,8 @@ def announce_task_transitions(task: Task, prev_state: str) -> None:
         print(f"\n{GREEN}→ Перешли к выполнению плана.{RESET}\n")
     elif prev_state == TaskState.INTAKE and task.state == TaskState.PLANNING:
         print(f"\n{GREEN}→ Уточнения собраны — перехожу к планированию.{RESET}\n")
+    elif prev_state == TaskState.PLANNING and task.state == TaskState.INTAKE:
+        print(f"\n{YELLOW}↺ На планировании всплыли вопросы — возвращаюсь к сбору уточнений.{RESET}\n")
     else:
         print(f"\n{DIM}→ {prev_state} → {task.state}{RESET}\n")
 
