@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from app.orchestrator import Orchestrator
 from app.ports import (
     GigaChatClient,
     InvariantRepository,
@@ -29,7 +30,8 @@ def handle_task(cmd_str: str,
                 client: GigaChatClient,
                 task_repo: TaskRepository,
                 knowledge_repo: KnowledgeRepository,
-                invariant_repo: Optional[InvariantRepository] = None) -> None:
+                invariant_repo: Optional[InvariantRepository] = None,
+                orchestrator: Optional[Orchestrator] = None) -> None:
     """Обработка /task <sub> ..."""
     parts = cmd_str.split(None, 2)
     sub = parts[1].lower() if len(parts) > 1 else "show"
@@ -66,7 +68,8 @@ def handle_task(cmd_str: str,
             with Spinner("Думаю..."):
                 reply = advance_task(task, request, params, profile_text, wm,
                                      client, task_repo, knowledge_repo,
-                                     invariant_repo=invariant_repo)
+                                     invariant_repo=invariant_repo,
+                                     orchestrator=orchestrator)
         except Exception as e:
             print(f"{YELLOW}  Ошибка стадии: {e}{RESET}")
             return
