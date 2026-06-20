@@ -47,8 +47,12 @@ class SessionRepository(Protocol):
         ...
 
 
-class GigaChatClient(Protocol):
-    """Клиент модели. Скрывает OAuth, токен-кэш и HTTP-транспорт."""
+class LLMClient(Protocol):
+    """Клиент LLM-провайдера. Скрывает аутентификацию и HTTP-транспорт.
+
+    Используется поверх любого провайдера (DeepSeek, GigaChat, …); конкретная
+    реализация выбирается в composition root по `LLM_PROVIDER`.
+    """
 
     def chat(self,
              messages: list,

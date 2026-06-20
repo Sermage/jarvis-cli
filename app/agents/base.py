@@ -13,9 +13,9 @@ from typing import Optional, Protocol
 from app.invariant_guard import GuardedResult
 from app.parsers import parse_questions
 from app.ports import (
-    GigaChatClient,
     InvariantRepository,
     KnowledgeRepository,
+    LLMClient,
 )
 from domain.task import Task
 from domain.working_memory import WorkingMemory
@@ -30,7 +30,7 @@ class AgentContext:
     params:           dict
     profile_text:     Optional[str]
     wm:               WorkingMemory
-    client:           GigaChatClient
+    client:           LLMClient
     knowledge_repo:   KnowledgeRepository
     invariant_repo:   Optional[InvariantRepository] = None
     restoration_hint: bool = False

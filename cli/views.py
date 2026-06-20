@@ -12,7 +12,6 @@ from app.invariant_guard import GuardedResult
 from app.ports import KnowledgeRepository, SessionRepository, TaskRepository
 from app.stage_prompts import STAGE_ORDER
 from cli.ansi import BLUE, BOLD, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW
-from cli.config import MODELS
 from domain.invariant import InvariantSeverity
 from domain.profile import Profile
 from domain.task import Task, TaskState
@@ -253,6 +252,7 @@ def print_mem_detail(messages: list,
 def print_help() -> None:
     print(f"""
 {BOLD}Чат:{RESET}
+  {CYAN}/provider{RESET}       — переключить LLM-провайдера (deepseek / gigachat)
   {CYAN}/model{RESET}          — выбрать модель
   {CYAN}/temp{RESET}           — задать temperature
   {CYAN}/tokens{RESET}         — задать max_tokens

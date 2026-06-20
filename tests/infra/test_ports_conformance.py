@@ -7,13 +7,14 @@ isinstance с Protocol работает только с runtime_checkable, по�
 import inspect
 
 from app.ports import (
-    GigaChatClient,
     KnowledgeRepository,
+    LLMClient,
     ProfileRepository,
     SessionRepository,
     TaskRepository,
     WorkingMemoryRepository,
 )
+from infra.deepseek_client import DeepSeekClient
 from infra.gigachat_client import RequestsGigaChatClient
 from infra.knowledge_repository import FileKnowledgeRepository
 from infra.profile_repository import FileProfileRepository
@@ -46,7 +47,13 @@ def test_requests_gigachat_client_covers_port():
     client = RequestsGigaChatClient(
         auth_key="k", oauth_url="u", chat_url="c", scope="s",
     )
-    for name in _methods(GigaChatClient):
+    for name in _methods(LLMClient):
+        assert callable(getattr(client, name)), f"missing method: {name}"
+
+
+def test_deepseek_client_covers_port():
+    client = DeepSeekClient(api_key="k", chat_url="https://api.deepseek.com/chat/completions")
+    for name in _methods(LLMClient):
         assert callable(getattr(client, name)), f"missing method: {name}"
 
 

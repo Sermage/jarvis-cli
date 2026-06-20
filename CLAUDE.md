@@ -1,12 +1,15 @@
 # Jarvis CLI
 
-Терминальный чат с GigaChat (Sber). Один файл — `chat.py` (~1960 строк), запускается как `python3 chat.py` или через симлинк `jarvis`.
+Терминальный чат с LLM. Запускается как `python3 chat.py` или через симлинк `jarvis`.
 
 ## Стек
 
 - Python 3, `requests` — единственная внешняя зависимость
-- API: GigaChat (`gigachat.devices.sberbank.ru`), OAuth ключ из `.env` (`GIGACHAT_AUTH_KEY`)
-- TLS verify отключён (`urllib3.disable_warnings`) — особенность Sber API
+- Провайдер выбирается через `LLM_PROVIDER` в `.env` (или `/provider` в REPL):
+  - **`deepseek`** (по умолчанию) — OpenAI-совместимый API на `api.deepseek.com`, ключ `DEEPSEEK_API_KEY`
+  - **`gigachat`** — Sber GigaChat (`gigachat.devices.sberbank.ru`), OAuth ключ `GIGACHAT_AUTH_KEY`
+- Список моделей зависит от провайдера: `cli/config.py::MODELS_BY_PROVIDER`
+- TLS verify отключён для GigaChat (`urllib3.disable_warnings`) — особенность Sber API; DeepSeek работает с обычной проверкой сертификата
 
 ## Структура `chat.py`
 
@@ -51,7 +54,7 @@
 - Все пользовательские данные — в `~/.jarvis/`, не в репо
 - UI-тексты, команды и сообщения — на русском
 - ANSI-цвета через константы в секции `# ── ANSI colors ──`
-- Команды чата начинаются с `/` (`/model`, `/wm`, `/know`, `/profile`, `/task`, `/mem`, `/clear`, `/quit`)
+- Команды чата начинаются с `/` (`/provider`, `/model`, `/wm`, `/know`, `/profile`, `/task`, `/mem`, `/clear`, `/quit`)
 - Новые команды добавляются в диспетчер внутри `main()` и в `print_help()`
 
 ## Архитектурные правила
@@ -63,9 +66,9 @@
 1. **`cli/`** — REPL, парсинг команд, диспетчер, ввод/вывод. Никакой бизнес-логики и I/O с диском/сетью напрямую.
 2. **`app/`** (use cases / services) — сценарии: «отправить сообщение», «сохранить знание», «продвинуть стадию задачи». Оркестрирует домен и порты.
 3. **`domain/`** — чистые модели и правила: `Task`, `TaskState`, `WorkingMemory`, `Profile`, `Knowledge`. Без зависимостей от внешних библиотек, без I/O.
-4. **`infra/`** — реализации портов: файловые репозитории (`~/.jarvis/...`), GigaChat-клиент, токен-кэш, ANSI-вывод, спиннер.
+4. **`infra/`** — реализации портов: файловые репозитории (`~/.jarvis/...`), LLM-клиенты (`DeepSeekClient`, `RequestsGigaChatClient`), токен-кэш, ANSI-вывод, спиннер.
 
-Верхний слой не знает о деталях нижнего: `app/` оперирует абстракциями (`SessionRepository`, `GigaChatClient`, `Clock`), а не `open()` и `requests`.
+Верхний слой не знает о деталях нижнего: `app/` оперирует абстракциями (`SessionRepository`, `LLMClient`, `Clock`), а не `open()` и `requests`.
 
 ### Dependency Injection
 

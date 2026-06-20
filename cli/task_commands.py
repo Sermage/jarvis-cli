@@ -5,9 +5,9 @@ from typing import Optional
 
 from app.orchestrator import Orchestrator
 from app.ports import (
-    GigaChatClient,
     InvariantRepository,
     KnowledgeRepository,
+    LLMClient,
     TaskRepository,
 )
 from app.stage_prompts import next_forward_state
@@ -27,7 +27,7 @@ def handle_task(cmd_str: str,
                 params: dict,
                 current_profile: Optional[Profile],
                 wm: WorkingMemory,
-                client: GigaChatClient,
+                client: LLMClient,
                 task_repo: TaskRepository,
                 knowledge_repo: KnowledgeRepository,
                 invariant_repo: Optional[InvariantRepository] = None,

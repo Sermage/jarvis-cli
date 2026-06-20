@@ -20,15 +20,29 @@ def load_env(env_path: str) -> None:
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-# ── GigaChat endpoints ──────────────────────────────────────────────────────
+# ── LLM-провайдеры ──────────────────────────────────────────────────────────
 
-OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-CHAT_URL  = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-SCOPE     = "GIGACHAT_API_PERS"
+DEEPSEEK   = "deepseek"
+GIGACHAT   = "gigachat"
+PROVIDERS  = (DEEPSEEK, GIGACHAT)
+DEFAULT_PROVIDER = DEEPSEEK
 
-# ── модели и дефолты ────────────────────────────────────────────────────────
+# ── DeepSeek ────────────────────────────────────────────────────────────────
 
-MODELS = {
+DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
+
+DEEPSEEK_MODELS = {
+    "1": ("deepseek-chat",     "DeepSeek-V3 (chat)"),
+    "2": ("deepseek-reasoner", "DeepSeek-R1 (reasoner)"),
+}
+
+# ── GigaChat ────────────────────────────────────────────────────────────────
+
+GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+GIGACHAT_CHAT_URL  = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+GIGACHAT_SCOPE     = "GIGACHAT_API_PERS"
+
+GIGACHAT_MODELS = {
     "1": ("GigaChat",       "GigaChat (слабая)"),
     "2": ("GigaChat-Pro",   "GigaChat-Pro (средняя)"),
     "3": ("GigaChat-Max",   "GigaChat-Max (сильная)"),
@@ -37,8 +51,35 @@ MODELS = {
     "6": ("GigaChat-2-Max", "GigaChat-2-Max (сильная, v2)"),
 }
 
+# ── провайдер → модели / дефолт ─────────────────────────────────────────────
+
+MODELS_BY_PROVIDER = {
+    DEEPSEEK: DEEPSEEK_MODELS,
+    GIGACHAT: GIGACHAT_MODELS,
+}
+
+DEFAULT_MODEL_BY_PROVIDER = {
+    DEEPSEEK: "deepseek-chat",
+    GIGACHAT: "GigaChat",
+}
+
+
+def models_for(provider: str) -> dict:
+    return MODELS_BY_PROVIDER[provider]
+
+
+def default_model_for(provider: str) -> str:
+    return DEFAULT_MODEL_BY_PROVIDER[provider]
+
+
+def resolve_provider(env_value: str) -> str:
+    """Нормализовать значение LLM_PROVIDER, упасть на default при пустом/неизвестном."""
+    v = (env_value or "").strip().lower()
+    return v if v in PROVIDERS else DEFAULT_PROVIDER
+
+
 DEFAULT_PARAMS = {
-    "model":       "GigaChat",
+    "model":       DEFAULT_MODEL_BY_PROVIDER[DEFAULT_PROVIDER],
     "temperature": None,
     "max_tokens":  None,
 }

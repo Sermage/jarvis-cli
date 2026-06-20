@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from app.ports import GigaChatClient
+from app.ports import LLMClient
 from domain.invariant import InvariantSet, InvariantSeverity, Violation
 
 
@@ -29,7 +29,7 @@ class GuardedResult:
     blocked: bool = False
 
 
-def guarded_chat(client: GigaChatClient,
+def guarded_chat(client: LLMClient,
                  messages: list,
                  params: dict,
                  system_prompt: Optional[str],

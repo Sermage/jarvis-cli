@@ -12,9 +12,9 @@ from typing import Callable, Optional
 from app.agents import AgentContext
 from app.orchestrator import Orchestrator, build_default_orchestrator
 from app.ports import (
-    GigaChatClient,
     InvariantRepository,
     KnowledgeRepository,
+    LLMClient,
     TaskRepository,
 )
 from domain.task import StageStatus, Task, TaskState
@@ -39,7 +39,7 @@ def advance_task(task: Task,
                  params: dict,
                  profile_text: Optional[str],
                  wm: WorkingMemory,
-                 client: GigaChatClient,
+                 client: LLMClient,
                  task_repo: TaskRepository,
                  knowledge_repo: KnowledgeRepository,
                  invariant_repo: Optional[InvariantRepository] = None,

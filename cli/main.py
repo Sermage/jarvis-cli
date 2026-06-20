@@ -23,21 +23,26 @@ from app.task_driver import (
     handle_plan_approval,
     handle_plan_revision,
 )
-from cli.ansi import BOLD, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW
+from cli.ansi import BOLD, CLEAR_SCREEN, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW
 from cli.config import (
     ACTIVE_TASK_FILE,
-    CHAT_URL,
+    DEEPSEEK,
+    DEEPSEEK_CHAT_URL,
     DEFAULT_PARAMS,
+    GIGACHAT,
+    GIGACHAT_CHAT_URL,
+    GIGACHAT_OAUTH_URL,
+    GIGACHAT_SCOPE,
     HISTORY_DIR,
     INVARIANTS_DIR,
     KNOWLEDGE_DIR,
     MAX_SESSIONS,
-    OAUTH_URL,
     PROFILES_DIR,
-    SCOPE,
     TASKS_DIR,
     WORKING_DIR,
+    default_model_for,
     load_env,
+    resolve_provider,
 )
 from cli.invariant_commands import handle_inv
 from cli.know_commands import handle_know
@@ -47,7 +52,12 @@ from cli.profile_commands import (
     delete_profile,
     edit_profile,
 )
-from cli.settings_commands import choose_model, set_max_tokens, set_temperature
+from cli.settings_commands import (
+    choose_model,
+    choose_provider,
+    set_max_tokens,
+    set_temperature,
+)
 from cli.spinner import Spinner
 from cli.task_commands import handle_task
 from cli.views import (
@@ -61,7 +71,9 @@ from cli.views import (
     wm_show,
 )
 from cli.wm_commands import handle_wm
+from app.ports import LLMClient
 from domain.profile import Profile
+from infra.deepseek_client import DeepSeekClient
 from infra.gigachat_client import RequestsGigaChatClient
 from infra.invariant_repository import FileInvariantRepository
 from infra.knowledge_repository import FileKnowledgeRepository
@@ -74,14 +86,47 @@ from infra.working_memory_repository import FileWorkingMemoryRepository
 _YES = {"y", "yes", "да", "д"}
 
 
+def _build_client(provider: str) -> LLMClient:
+    """Собрать LLM-клиент для выбранного провайдера.
+
+    Ключи читаются из os.environ; вызывающий код отвечает за то, чтобы
+    .env был уже подгружен.
+    """
+    if provider == DEEPSEEK:
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            print(f"{YELLOW}Ошибка: DEEPSEEK_API_KEY не задан.{RESET}")
+            print(f"{DIM}Получить ключ: https://platform.deepseek.com/api_keys{RESET}")
+            print(f"{DIM}И прописать в .env: DEEPSEEK_API_KEY=...{RESET}\n")
+            sys.exit(1)
+        return DeepSeekClient(api_key=api_key, chat_url=DEEPSEEK_CHAT_URL)
+
+    if provider == GIGACHAT:
+        auth_key = os.environ.get("GIGACHAT_AUTH_KEY", "")
+        if not auth_key:
+            print(f"{YELLOW}Ошибка: GIGACHAT_AUTH_KEY не задан.{RESET}")
+            print(f"{DIM}Получить ключ: https://developers.sber.ru/studio{RESET}")
+            print(f"{DIM}И прописать в .env: GIGACHAT_AUTH_KEY=...{RESET}\n")
+            sys.exit(1)
+        return RequestsGigaChatClient(
+            auth_key  = auth_key,
+            oauth_url = GIGACHAT_OAUTH_URL,
+            chat_url  = GIGACHAT_CHAT_URL,
+            scope     = GIGACHAT_SCOPE,
+        )
+
+    raise RuntimeError(f"Неизвестный провайдер: {provider}")
+
+
 def main():
     # .env лежит рядом с настоящим entrypoint-файлом (chat.py), а не рядом
     # с симлинком jarvis в /usr/local/bin — поэтому realpath.
     entrypoint = os.path.realpath(sys.argv[0]) if sys.argv and sys.argv[0] else __file__
     load_env(os.path.join(os.path.dirname(entrypoint), ".env"))
-    auth_key = os.environ.get("GIGACHAT_AUTH_KEY", "")
 
+    provider = resolve_provider(os.environ.get("LLM_PROVIDER", ""))
     params   = dict(DEFAULT_PARAMS)
+    params["model"] = default_model_for(provider)
     messages: list = []
     current_session_id: Optional[str] = None
 
@@ -92,21 +137,12 @@ def main():
     profile_repo   = FileProfileRepository(PROFILES_DIR)
     knowledge_repo = FileKnowledgeRepository(KNOWLEDGE_DIR)
     invariant_repo = FileInvariantRepository(INVARIANTS_DIR)
-    client         = RequestsGigaChatClient(
-        auth_key  = auth_key,
-        oauth_url = OAUTH_URL,
-        chat_url  = CHAT_URL,
-        scope     = SCOPE,
-    )
-    orchestrator   = build_default_orchestrator(task_repo)
 
-    print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}\n")
+    print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}")
+    print(f"{DIM}провайдер: {provider}{RESET}\n")
 
-    if not auth_key:
-        print(f"{YELLOW}Ошибка: GIGACHAT_AUTH_KEY не задан.{RESET}")
-        print(f"{DIM}Создайте файл .env рядом с chat.py:{RESET}")
-        print(f"{DIM}  GIGACHAT_AUTH_KEY=ваш_ключ{RESET}\n")
-        sys.exit(1)
+    client       = _build_client(provider)
+    orchestrator = build_default_orchestrator(task_repo)
 
     # Инициализация долговременной памяти
     current_profile: Optional[Profile] = profile_repo.ensure_default()
@@ -182,7 +218,15 @@ def main():
                 print(f"{DIM}Выход.{RESET}")
                 break
             elif cmd == "/model":
-                choose_model(params)
+                choose_model(params, provider)
+            elif cmd == "/provider":
+                new_provider = choose_provider(provider)
+                if new_provider != provider:
+                    provider = new_provider
+                    params["model"] = default_model_for(provider)
+                    client = _build_client(provider)
+                    print(f"{GREEN}Провайдер переключён: {provider}{RESET}")
+                    print(f"{DIM}модель сброшена на дефолт: {params['model']}{RESET}")
             elif cmd == "/temp":
                 set_temperature(params)
             elif cmd == "/tokens":
@@ -212,11 +256,15 @@ def main():
             elif cmd == "/profile":
                 current_profile = choose_profile(profile_repo, current_profile)
             elif cmd == "/clear":
-                if current_session_id:
-                    session_repo.delete(current_session_id)
-                    current_session_id = None
+                # Не удаляем файл сессии — он остаётся в истории (~/.jarvis/sessions),
+                # и его можно выбрать при следующем запуске. Просто сбрасываем
+                # in-memory диалог; следующее сообщение породит новый session_id.
+                current_session_id = None
                 messages.clear()
-                print(f"{DIM}Краткосрочная память очищена (диалог).{RESET}")
+                print(CLEAR_SCREEN, end="")
+                print(f"{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(новая сессия, /help — справка){RESET}")
+                print(f"{DIM}провайдер: {provider}{RESET}\n")
+                print(f"{DIM}Краткосрочная память очищена. Старая сессия сохранена в истории.{RESET}")
             elif cmd == "/help":
                 print_help()
             else:
