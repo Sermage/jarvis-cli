@@ -139,6 +139,38 @@ def test_step_with_questions_holds_stage_awaiting_clarification():
     assert task.stages[TaskState.INTAKE].status == StageStatus.AWAITING_USER
 
 
+def test_step_with_questions_and_rollback_moves_task_to_earlier_stage():
+    task = Task.new("x")
+    task.transition(TaskState.PLANNING)
+    # имитируем заход на стадию PLANNING с накопленным output
+    from domain.task import StageResult
+    task.stages[TaskState.PLANNING] = StageResult(
+        status=StageStatus.IN_PROGRESS,
+        output="черновой план был",
+        started_at="2026-06-19 09:00:00",
+    )
+    agent = _RecordingAgent(TaskState.PLANNING, AgentResult(
+        reply="[QUESTION] что?", guarded=_clean(),
+        questions=["что?"],
+        rollback_to=TaskState.INTAKE,
+        transition_reason="откат",
+    ))
+    repo = _FakeTaskRepo()
+    orch = Orchestrator({TaskState.PLANNING: agent}, repo)
+
+    orch.step(task, "x", _ctx())
+    # задача откатилась в INTAKE с висящими вопросами
+    assert task.state == TaskState.INTAKE
+    assert task.awaiting == "clarification"
+    assert task.pending_questions == ["что?"]
+    # старый output planning сброшен — следующий заход начнётся с нуля
+    assert task.stages[TaskState.PLANNING].output == ""
+    assert task.stages[TaskState.PLANNING].status == StageStatus.PENDING
+    # новая стадия (INTAKE) помечена как ожидающая пользователя
+    assert task.stages[TaskState.INTAKE].status == StageStatus.AWAITING_USER
+    assert (TaskState.PLANNING, TaskState.INTAKE, "откат") in repo.transitions
+
+
 def test_step_with_plan_approval_awaits():
     task = Task.new("x")
     task.transition(TaskState.PLANNING)

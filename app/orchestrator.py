@@ -149,6 +149,26 @@ class Orchestrator:
         if result.questions:
             task.pending_questions = result.questions
             task.awaiting = "clarification"
+            # Откат: уточнения собираются не здесь, а на более ранней стадии
+            # (например, на PLANNING всплыли вопросы — возвращаемся в INTAKE).
+            # Текущая стадия сбрасывается до pending и пустого output, чтобы
+            # после ответа пользователя её можно было пройти заново с чистого листа.
+            if result.rollback_to:
+                stage_obj.output      = ""
+                stage_obj.status      = StageStatus.PENDING
+                stage_obj.started_at  = None
+                stage_obj.finished_at = None
+                task.stages[task.state] = stage_obj
+                self._task_repo.transition(
+                    task,
+                    result.rollback_to,
+                    reason=result.transition_reason or "откат для сбора уточнений",
+                )
+                new_stage = task.stages.get(task.state) or StageResult()
+                new_stage.status = StageStatus.AWAITING_USER
+                task.stages[task.state] = new_stage
+                self._task_repo.save(task)
+                return
             stage_obj.status = StageStatus.AWAITING_USER
             task.stages[task.state] = stage_obj
             self._task_repo.save(task)

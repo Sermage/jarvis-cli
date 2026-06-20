@@ -81,12 +81,14 @@ def test_planner_clean_reply_awaits_plan_approval():
     assert res.auto_transition_to is None
 
 
-def test_planner_with_questions_does_not_await_approval():
+def test_planner_with_questions_rolls_back_to_intake():
     task = Task.new("x")
     task.transition(TaskState.PLANNING)
     res = PlannerAgent().run(task, "", _ctx(_FakeClient("[QUESTION] деплой куда?")))
     assert res.questions == ["деплой куда?"]
     assert not res.awaits_plan_approval
+    assert res.rollback_to == TaskState.INTAKE
+    assert res.transition_reason
 
 
 # ── ExecutorAgent ───────────────────────────────────────────────────────────

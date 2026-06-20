@@ -49,6 +49,11 @@ class AgentResult:
     `extra_artifacts` — словарь, который оркестратор сольёт поверх
     `stage.artifacts` после прогона. Через него агент сохраняет структурную
     телеметрию (например, список подзадач у роевого исполнителя).
+
+    `rollback_to` используется вместе с `questions`: если агент решил, что
+    уточнения должны собираться не здесь, а на более ранней стадии (например,
+    PLANNING откатывается в INTAKE) — оркестратор переведёт задачу туда и
+    повесит вопросы уже на новую стадию.
     """
     reply:                str
     guarded:              GuardedResult
@@ -57,6 +62,7 @@ class AgentResult:
     auto_transition_to:   Optional[str] = None
     transition_reason:    str = ""
     extra_artifacts:      dict = field(default_factory=dict)
+    rollback_to:          Optional[str] = None
 
 
 class StageAgent(Protocol):

@@ -6,9 +6,9 @@
 """
 from __future__ import annotations
 
-from app.agents.base import AgentResult, _BaseStageAgent
+from app.agents.base import AgentContext, AgentResult, _BaseStageAgent
 from app.invariant_guard import GuardedResult
-from app.parsers import parse_validation_verdict
+from app.parsers import parse_questions, parse_validation_verdict
 from domain.task import Task, TaskState
 
 
@@ -26,8 +26,32 @@ class IntakeAgent(_BaseStageAgent):
 
 
 class PlannerAgent(_BaseStageAgent):
-    """PLANNING: план готов — переходим в режим ожидания утверждения."""
+    """PLANNING: вопросы запрещены — либо план, либо откат на INTAKE.
+
+    На стадии планирования промпт запрещает [QUESTION]: фаза уточнений уже
+    отработала в INTAKE. Если модель всё же задала вопросы, это сигнал, что
+    INTAKE не добрал контекст — возвращаем задачу в INTAKE, пусть уточнения
+    собираются там. Чистый ответ означает готовый план → ждём утверждения.
+    """
     stage = TaskState.PLANNING
+
+    def run(self, task: Task, followup_message: str,
+            ctx: AgentContext) -> AgentResult:
+        from app.agents._prompting import build_full_prompt, call_llm
+
+        system_prompt = build_full_prompt(task, ctx)
+        guarded       = call_llm(ctx, system_prompt, user_message=followup_message)
+        reply         = guarded.reply
+
+        questions = parse_questions(reply)
+        if questions:
+            return AgentResult(
+                reply=reply, guarded=guarded,
+                questions=questions,
+                rollback_to=TaskState.INTAKE,
+                transition_reason="на PLANNING всплыли уточняющие вопросы — откат на INTAKE",
+            )
+        return self._on_clean_reply(task, reply, guarded)
 
     def _on_clean_reply(self, task: Task, reply: str,
                         guarded: GuardedResult) -> AgentResult:
