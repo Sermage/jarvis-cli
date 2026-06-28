@@ -10,6 +10,7 @@ from typing import Optional, Protocol
 
 from domain.invariant import Invariant, InvariantSet
 from domain.knowledge import KnowledgeEntry
+from domain.mcp import McpServerConfig, McpTool, ToolResult
 from domain.profile import Profile
 from domain.task import Task
 from domain.working_memory import WorkingMemory
@@ -58,6 +59,57 @@ class LLMClient(Protocol):
              messages: list,
              params: dict,
              system_prompt: Optional[str] = None) -> str: ...
+
+
+class ToolCallingLLMClient(LLMClient, Protocol):
+    """Расширение LLMClient для провайдеров с поддержкой function/tool calling.
+
+    Возвращает «сырой» message-объект OpenAI-формата:
+        {"content": Optional[str], "tool_calls": list[dict]}
+    Это нужно ToolRouter'у — он добавляет ответ ассистента в историю как
+    есть (с массивом tool_calls), затем подкладывает tool-сообщения и снова
+    вызывает модель. Реализуется только теми клиентами, чей API это умеет
+    (сейчас — DeepSeek; GigaChat пока без тулов).
+    """
+
+    def chat_with_tools(self,
+                        messages: list,
+                        params: dict,
+                        tools: list,
+                        system_prompt: Optional[str] = None) -> dict: ...
+
+
+class McpClient(Protocol):
+    """Подключение к одному MCP-серверу.
+
+    Жизненный цикл: `start()` запускает транспорт и делает initialize-хендшейк,
+    дальше можно вызывать `list_tools` и `call_tool`. `close()` гасит сервер.
+    """
+    server_id: str
+
+    def start(self) -> None: ...
+    def list_tools(self) -> list[McpTool]: ...
+    def call_tool(self, name: str, arguments: dict) -> ToolResult: ...
+    def close(self) -> None: ...
+
+
+class McpRegistry(Protocol):
+    """Реестр активных MCP-клиентов, индексируемых по `server_id`."""
+
+    def clients(self) -> list[McpClient]: ...
+    def get(self, server_id: str) -> Optional[McpClient]: ...
+    def all_tools(self) -> list[McpTool]: ...
+    def shutdown(self) -> None: ...
+
+
+class McpConfigRepository(Protocol):
+    """Хранилище конфигурации MCP-серверов (~/.jarvis/mcp/servers.json)."""
+
+    def list_all(self) -> list[McpServerConfig]: ...
+    def get(self, server_id: str) -> Optional[McpServerConfig]: ...
+    def save(self, cfg: McpServerConfig) -> None: ...
+    def delete(self, server_id: str) -> None: ...
+    def set_enabled(self, server_id: str, enabled: bool) -> None: ...
 
 
 class TaskRepository(Protocol):

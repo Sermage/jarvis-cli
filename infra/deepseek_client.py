@@ -3,6 +3,9 @@
 DeepSeek предоставляет OpenAI-совместимый API: один POST на
 `/chat/completions` с Bearer-токеном, без отдельного OAuth-обмена.
 Зависимости (транспорт) инжектятся через конструктор для тестируемости.
+
+Поддерживается tool calling (OpenAI-формат) — это нужно ToolRouter'у
+для маршрутизации запросов на MCP-серверы.
 """
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ import requests
 
 
 class DeepSeekClient:
-    """Реализация LLMClient поверх DeepSeek API.
+    """Реализация LLMClient + ToolCallingLLMClient поверх DeepSeek API.
 
     Транспорт ожидается совместимым с `requests.post`:
     принимает `url, headers=..., json=..., timeout=...` и возвращает объект
@@ -33,6 +36,39 @@ class DeepSeekClient:
              messages: list,
              params: dict,
              system_prompt: Optional[str] = None) -> str:
+        body = self._build_body(messages, params, system_prompt)
+        msg = self._post_chat(body)
+        return msg.get("content") or ""
+
+    def chat_with_tools(self,
+                        messages: list,
+                        params: dict,
+                        tools: list,
+                        system_prompt: Optional[str] = None) -> dict:
+        """Расширенный вызов: пробрасывает `tools` и возвращает «сырой» message.
+
+        Формат возвращаемого dict:
+            {"content": Optional[str], "tool_calls": list[dict]}
+        где каждый tool_call — OpenAI-формат
+            {"id": str, "type": "function", "function": {"name": str, "arguments": str}}
+        ToolRouter сам распарсит arguments (JSON-строку) и развернёт цикл.
+        """
+        body = self._build_body(messages, params, system_prompt)
+        if tools:
+            body["tools"]       = tools
+            body["tool_choice"] = "auto"
+        msg = self._post_chat(body)
+        return {
+            "content":    msg.get("content"),
+            "tool_calls": msg.get("tool_calls") or [],
+        }
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _build_body(self,
+                    messages: list,
+                    params: dict,
+                    system_prompt: Optional[str]) -> dict:
         api_messages = messages
         if system_prompt:
             api_messages = [{"role": "system", "content": system_prompt}] + messages
@@ -41,7 +77,9 @@ class DeepSeekClient:
             body["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             body["max_tokens"] = params["max_tokens"]
+        return body
 
+    def _post_chat(self, body: dict) -> dict:
         resp = self._post(
             self._chat_url,
             headers={
@@ -52,4 +90,4 @@ class DeepSeekClient:
             timeout=self._chat_timeout,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        return resp.json()["choices"][0]["message"]

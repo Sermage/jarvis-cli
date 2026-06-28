@@ -11,6 +11,7 @@ from typing import Optional
 from app.invariant_guard import GuardedResult
 from app.ports import KnowledgeRepository, SessionRepository, TaskRepository
 from app.stage_prompts import STAGE_ORDER
+from app.tool_router import ToolLoopResult
 from cli.ansi import BLUE, BOLD, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW
 from domain.invariant import InvariantSeverity
 from domain.profile import Profile
@@ -246,6 +247,38 @@ def print_mem_detail(messages: list,
     print()
 
 
+# ── tool router trace ───────────────────────────────────────────────────────
+
+
+def print_tool_trace(loop: ToolLoopResult) -> None:
+    """Печатает цепочку MCP-вызовов, которые модель сделала за tool-loop.
+
+    Это и есть «доказательство», что агент сам выбрал тулы, маршрутизировал
+    их по разным серверам и шёл по длинному флоу.
+    """
+    if not loop.trace:
+        return
+    print(f"\n{DIM}┌─ MCP tool-loop ({len(loop.trace)} вызов(а), "
+          f"итераций: {loop.iterations}){RESET}")
+    for inv in loop.trace:
+        marker = f"{YELLOW}✗{RESET}" if inv.is_error else f"{GREEN}✓{RESET}"
+        args_preview = _short_repr(inv.arguments, 60)
+        result_preview = _short_repr(inv.result_text, 80)
+        print(f"{DIM}│{RESET} {marker} #{inv.iteration} "
+              f"{BOLD}{MAGENTA}{inv.server_id}{RESET}.{CYAN}{inv.tool_name}{RESET}"
+              f"({args_preview})")
+        print(f"{DIM}│   → {result_preview}{RESET}")
+    suffix = f" {YELLOW}(truncated at max_iterations){RESET}" if loop.truncated else ""
+    print(f"{DIM}└─{RESET}{suffix}")
+
+
+def _short_repr(value, limit: int) -> str:
+    s = str(value).replace("\n", " ")
+    if len(s) <= limit:
+        return s
+    return s[:limit - 1] + "…"
+
+
 # ── help ────────────────────────────────────────────────────────────────────
 
 
@@ -279,6 +312,14 @@ def print_help() -> None:
   {CYAN}/inv add  <id>{RESET}   — создать новый (с шагом редактирования в editor)
   {CYAN}/inv edit <id>{RESET}   — открыть JSON-файл в $EDITOR
   {CYAN}/inv rm   <id>{RESET}   — удалить (block — с подтверждением)
+
+{BOLD}{MAGENTA}MCP-серверы (/mcp):{RESET}
+  {CYAN}/mcp list{RESET}              — настроенные серверы и их статус
+  {CYAN}/mcp tools{RESET}             — все обнаруженные тулы
+  {CYAN}/mcp add <id> <cmd> ...{RESET} — зарегистрировать stdio-сервер
+  {CYAN}/mcp rm <id>{RESET}           — удалить из конфига
+  {CYAN}/mcp enable|disable <id>{RESET} — включить/выключить (нужен рестарт)
+  {DIM}Tool calling работает только для DeepSeek. После /mcp add/rm — рестарт чата.{RESET}
 
 {BOLD}Задачи (/task):{RESET}
   {CYAN}/task new <описание>{RESET} — создать задачу и начать стадию intake

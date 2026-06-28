@@ -111,3 +111,46 @@ def test_no_oauth_call_made():
     client.chat([{"role": "user", "content": "x"}], {"model": "m"})
     # Ровно один HTTP-запрос — сразу на /chat/completions.
     assert len(fake.calls) == 1
+
+
+# ── tool calling ─────────────────────────────────────────────────────────────
+
+
+def test_chat_with_tools_sends_tools_and_tool_choice_auto():
+    fake = _FakePost([_FakeResponse({
+        "choices": [{"message": {"content": None,
+                                 "tool_calls": [{"id": "c1", "type": "function",
+                                                 "function": {"name": "x__y",
+                                                              "arguments": "{}"}}]}}]
+    })])
+    client = _client(fake)
+    tools = [{"type": "function", "function": {"name": "x__y", "description": "",
+                                                "parameters": {}}}]
+    msg = client.chat_with_tools([{"role": "user", "content": "?"}],
+                                 {"model": "m"}, tools=tools)
+    body = fake.calls[0]["json"]
+    assert body["tools"] == tools
+    assert body["tool_choice"] == "auto"
+    assert msg["content"] is None
+    assert msg["tool_calls"][0]["function"]["name"] == "x__y"
+
+
+def test_chat_with_tools_omits_tools_when_empty():
+    """Если тулов нет — поле tools в body вообще отсутствует (а не пустое)."""
+    fake = _FakePost([_FakeResponse({"choices": [{"message": {"content": "ok"}}]})])
+    client = _client(fake)
+    client.chat_with_tools([{"role": "user", "content": "x"}], {"model": "m"}, tools=[])
+    body = fake.calls[0]["json"]
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+def test_chat_with_tools_returns_empty_tool_calls_when_none():
+    fake = _FakePost([_FakeResponse({"choices": [{"message": {"content": "finished"}}]})])
+    client = _client(fake)
+    msg = client.chat_with_tools([{"role": "user", "content": "x"}],
+                                 {"model": "m"},
+                                 tools=[{"type": "function",
+                                         "function": {"name": "x", "description": "",
+                                                      "parameters": {}}}])
+    assert msg == {"content": "finished", "tool_calls": []}
