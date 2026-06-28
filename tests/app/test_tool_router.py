@@ -251,6 +251,72 @@ def test_tool_call_exception_is_captured_not_raised():
     assert "server died" in result.trace[0].result_text
 
 
+def test_consecutive_failures_add_hint_to_tool_message():
+    """После порога подряд-падений в tool-message подкладывается hint,
+    чтобы LLM не упёрлась в max_iterations с одной и той же ошибкой."""
+    bad = FakeMcpClient(server_id="srv", tools=[_tool("srv", "broken")],
+                        responses={"broken": ToolResult(text="boom", is_error=True)})
+    registry = FakeRegistry(by_id={"srv": bad})
+    llm = FakeLLM(script=[
+        {"content": None, "tool_calls": [_tool_call("a", "srv__broken", {})]},
+        {"content": None, "tool_calls": [_tool_call("b", "srv__broken", {})]},
+        {"content": None, "tool_calls": [_tool_call("c", "srv__broken", {})]},
+        {"content": "сдаюсь"},
+    ])
+    router = ToolRouter(llm, registry, failure_hint_threshold=2)
+    router.chat([{"role": "user", "content": "?"}], {"model": "m"})
+
+    # Третий и четвёртый вызовы LLM содержат tool-сообщения. После 1-го провала
+    # подсказки ещё нет, после 2-го (порог=2) — есть, после 3-го — тоже.
+    second_tool_msg = llm.calls[1]["messages"][-1]
+    third_tool_msg  = llm.calls[2]["messages"][-1]
+    fourth_tool_msg = llm.calls[3]["messages"][-1]
+    assert "[hint]" not in second_tool_msg["content"]
+    assert "[hint]" in third_tool_msg["content"]
+    assert "[hint]" in fourth_tool_msg["content"]
+    assert "srv.broken" in third_tool_msg["content"]
+
+
+def test_success_resets_failure_counter():
+    """Удачный вызов того же тула обнуляет счётчик — следующий провал
+    снова стартует с 1, а не сразу попадает в hint."""
+    calls = iter([
+        ToolResult(text="boom", is_error=True),
+        ToolResult(text="boom", is_error=True),
+        ToolResult(text="ok",   is_error=False),
+        ToolResult(text="boom", is_error=True),
+    ])
+
+    class _Stateful(FakeMcpClient):
+        def call_tool(self, name, arguments):
+            r = next(calls)
+            self.calls.append((name, dict(arguments)))
+            return r
+
+    srv = _Stateful(server_id="s", tools=[_tool("s", "t")])
+    registry = FakeRegistry(by_id={"s": srv})
+    llm = FakeLLM(script=[
+        {"content": None, "tool_calls": [_tool_call("1", "s__t", {})]},
+        {"content": None, "tool_calls": [_tool_call("2", "s__t", {})]},
+        {"content": None, "tool_calls": [_tool_call("3", "s__t", {})]},
+        {"content": None, "tool_calls": [_tool_call("4", "s__t", {})]},
+        {"content": "done"},
+    ])
+    router = ToolRouter(llm, registry, failure_hint_threshold=2)
+    router.chat([{"role": "user", "content": "?"}], {"model": "m"})
+
+    # Сообщения tool в истории (по индексу call):
+    msgs = [llm.calls[i]["messages"][-1]["content"] for i in range(1, 5)]
+    # 1-й провал — без hint
+    assert "[hint]" not in msgs[0]
+    # 2-й провал подряд — hint появился
+    assert "[hint]" in msgs[1]
+    # 3-й — успех, hint'а не должно быть
+    assert "[hint]" not in msgs[2]
+    # 4-й — снова провал, но это всего 1-й подряд после успеха — нет hint
+    assert "[hint]" not in msgs[3]
+
+
 def test_max_iterations_trunc_returns_truncated_flag():
     """Если модель упорно крутит тулы — обрываем после max_iterations."""
     fs = FakeMcpClient(server_id="fs", tools=[_tool("fs", "ls")], responses={"ls": "x"})

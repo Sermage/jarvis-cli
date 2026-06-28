@@ -62,10 +62,14 @@ class ToolRouter:
     def __init__(self,
                  llm: ToolCallingLLMClient,
                  registry: McpRegistry,
-                 max_iterations: int = 10):
+                 max_iterations: int = 20,
+                 failure_hint_threshold: int = 2):
         self._llm      = llm
         self._registry = registry
         self._max      = max_iterations
+        # Сколько подряд провалов одного и того же тула терпеть до того,
+        # как мы аннотируем tool-сообщение подсказкой «не упорствуй».
+        self._fail_threshold = failure_hint_threshold
 
     # ── публичный API ─────────────────────────────────────────────────────────
 
@@ -93,6 +97,10 @@ class ToolRouter:
 
         history = list(messages)
         trace: list[ToolInvocation] = []
+        # Счётчик подряд идущих провалов по каждому тулу. Если LLM упорно
+        # дёргает то же самое и оно падает, добавим в tool-message подсказку,
+        # чтобы модель сменила тактику и не упёрлась в max_iterations.
+        consecutive_failures: dict[tuple[str, str], int] = {}
 
         for iteration in range(1, self._max + 1):
             emit({"type": "thinking_start", "iteration": iteration})
@@ -124,10 +132,28 @@ class ToolRouter:
                 trace.append(invocation)
                 emit({"type": "tool_end", "iteration": iteration,
                       "invocation": invocation})
+
+                key = (invocation.server_id, invocation.tool_name)
+                if invocation.is_error:
+                    consecutive_failures[key] = consecutive_failures.get(key, 0) + 1
+                else:
+                    consecutive_failures[key] = 0
+
+                tool_content = invocation.result_text or "(no output)"
+                fail_n = consecutive_failures[key]
+                if fail_n >= self._fail_threshold:
+                    tool_content = (
+                        f"{tool_content}\n\n"
+                        f"[hint] тул {invocation.server_id}.{invocation.tool_name} "
+                        f"падает {fail_n} раз(а) подряд. Повтор с похожими аргументами "
+                        f"скорее всего тоже упадёт — попробуй другой тул, другой "
+                        f"сервер или сократи диапазон/объём запроса."
+                    )
+
                 history.append({
                     "role":         "tool",
                     "tool_call_id": invocation.call_id,
-                    "content":      invocation.result_text or "(no output)",
+                    "content":      tool_content,
                 })
 
         return ToolLoopResult(

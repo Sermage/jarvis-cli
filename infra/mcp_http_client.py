@@ -157,6 +157,14 @@ class HttpMcpClient:
         resp = self._post(self._url, headers=headers, json=msg,
                           timeout=timeout, stream=True)
         resp.raise_for_status()
+        # MCP-серверы шлют JSON в UTF-8, но многие забывают charset в Content-Type.
+        # requests по RFC2616 при отсутствии charset падает на ISO-8859-1 → кириллица
+        # на выходе становится мохайбэйком. Принудительно ставим utf-8 — это влияет
+        # и на resp.text (JSON-ветка), и на iter_lines(decode_unicode=True) (SSE).
+        try:
+            resp.encoding = "utf-8"
+        except (AttributeError, TypeError):
+            pass  # тестовые фейки могут не иметь сеттера
         new_sid = resp.headers.get("Mcp-Session-Id") if getattr(resp, "headers", None) else None
         if new_sid:
             self._session_id = new_sid
