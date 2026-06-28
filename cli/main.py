@@ -61,8 +61,14 @@ from cli.settings_commands import (
     set_max_tokens,
     set_temperature,
 )
+from cli.input_reader import (
+    disable_bracketed_paste,
+    enable_bracketed_paste,
+    read_input,
+)
 from cli.spinner import Spinner
 from cli.task_commands import handle_task
+from cli.tool_progress import ToolProgressReporter
 from cli.views import (
     announce_guard_result,
     announce_task_transitions,
@@ -70,7 +76,6 @@ from cli.views import (
     print_mem_detail,
     print_memory_status,
     print_settings,
-    print_tool_trace,
     show_task,
     wm_show,
 )
@@ -235,9 +240,15 @@ def main():
     import atexit
     atexit.register(mcp_registry.shutdown)
 
+    # Включаем bracketed paste, чтобы многострочный paste не отправлялся
+    # на первом же \n — REPL увидит вставку как одно сообщение и подождёт
+    # явный Enter после неё.
+    enable_bracketed_paste()
+    atexit.register(disable_bracketed_paste)
+
     while True:
         try:
-            user_input = input(f"{BOLD}{CYAN}You:{RESET} ").strip()
+            user_input = read_input(f"{BOLD}{CYAN}You:{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Выход.{RESET}")
             break
@@ -418,12 +429,20 @@ def main():
             invariant_repo,
         )
 
+        loop = None
+        guarded = None
+        reporter = ToolProgressReporter() if tool_router is not None else None
         try:
-            with Spinner("Думаю..."):
-                if tool_router is not None:
-                    loop = tool_router.chat(messages, params, system_prompt)
-                else:
-                    loop = None
+            if tool_router is not None:
+                # ToolProgressReporter сам ведёт спиннер «Думаю...» и печатает
+                # каждый tool_call вживую — внешний Spinner здесь не нужен.
+                try:
+                    loop = tool_router.chat(messages, params, system_prompt,
+                                            on_event=reporter)
+                finally:
+                    reporter.stop()
+            else:
+                with Spinner("Думаю..."):
                     guarded = guarded_chat(client, messages, params, system_prompt,
                                            invariant_repo.load_all(), max_retries=1)
         except requests.HTTPError as e:
@@ -449,9 +468,11 @@ def main():
             continue
 
         if loop is not None:
+            # Цепочка tool_call'ов уже распечатана live через reporter,
+            # повторно её показывать не нужно.
             reply = loop.reply
-            if loop.trace:
-                print_tool_trace(loop)
+            if loop.truncated:
+                print(f"{YELLOW}[!] tool-loop обрезан по лимиту итераций{RESET}")
             print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
         else:
             reply = guarded.reply

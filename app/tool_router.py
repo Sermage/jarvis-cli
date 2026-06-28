@@ -9,12 +9,17 @@
 Маршрутизация: имена тулов LLM получает как `serverId__toolName`,
 поэтому по префиксу до `__` всегда понятно, куда отправлять вызов.
 Это и есть «агент сам выбирает инструмент» из задания.
+
+Опциональный `on_event` коллбек получает события по мере их появления
+(`thinking_start`, `thinking_end`, `tool_start`, `tool_end`). CLI этим
+рисует live-прогресс — пользователь видит, какой тул дёргается прямо
+сейчас, как в Claude Code.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from app.ports import McpRegistry, ToolCallingLLMClient
 from domain.mcp import (
@@ -23,6 +28,9 @@ from domain.mcp import (
     make_qualified_tool_name,
     split_qualified_tool_name,
 )
+
+
+EventSink = Callable[[dict], None]
 
 
 @dataclass(frozen=True)
@@ -71,20 +79,28 @@ class ToolRouter:
     def chat(self,
              messages: list,
              params: dict,
-             system_prompt: Optional[str] = None) -> ToolLoopResult:
+             system_prompt: Optional[str] = None,
+             on_event: Optional[EventSink] = None) -> ToolLoopResult:
+        emit = _safe_emit(on_event)
         tools = self.collect_openai_tools()
         if not tools:
             # Нет тулов — обычный chat без tool calling.
+            emit({"type": "thinking_start", "iteration": 0})
             reply = self._llm.chat(messages, params, system_prompt)
+            emit({"type": "thinking_end", "iteration": 0,
+                  "had_tool_calls": False, "num_calls": 0})
             return ToolLoopResult(reply=reply, iterations=0)
 
         history = list(messages)
         trace: list[ToolInvocation] = []
 
         for iteration in range(1, self._max + 1):
+            emit({"type": "thinking_start", "iteration": iteration})
             msg = self._llm.chat_with_tools(history, params, tools, system_prompt)
             tool_calls = msg.get("tool_calls") or []
             content    = msg.get("content") or ""
+            emit({"type": "thinking_end", "iteration": iteration,
+                  "had_tool_calls": bool(tool_calls), "num_calls": len(tool_calls)})
 
             if not tool_calls:
                 return ToolLoopResult(
@@ -103,8 +119,11 @@ class ToolRouter:
             })
 
             for call in tool_calls:
+                self._emit_tool_start(emit, iteration, call)
                 invocation = self._dispatch_call(iteration, call)
                 trace.append(invocation)
+                emit({"type": "tool_end", "iteration": iteration,
+                      "invocation": invocation})
                 history.append({
                     "role":         "tool",
                     "tool_call_id": invocation.call_id,
@@ -117,6 +136,30 @@ class ToolRouter:
             trace      = trace,
             truncated  = True,
         )
+
+    @staticmethod
+    def _emit_tool_start(emit: EventSink, iteration: int, call: dict) -> None:
+        """Послать tool_start ДО фактического вызова — чтобы UI успел нарисовать.
+
+        Парсинг аргументов дублируется с `_dispatch_call`, но это копейки,
+        и зато тул-стартовое событие имеет уже разобранные args для печати.
+        """
+        function = call.get("function") or {}
+        qname    = function.get("name") or ""
+        raw_args = function.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        server_id, tool_name = split_qualified_tool_name(qname)
+        emit({
+            "type":      "tool_start",
+            "iteration": iteration,
+            "call_id":   call.get("id") or f"call_{iteration}",
+            "server_id": server_id,
+            "tool_name": tool_name,
+            "arguments": args,
+        })
 
     # ── внутренности ──────────────────────────────────────────────────────────
 
@@ -191,3 +234,18 @@ class ToolRouter:
 def make_tool_name(server_id: str, tool_name: str) -> str:
     """Реэкспорт хелпера — удобно использовать в тестах и CLI."""
     return make_qualified_tool_name(server_id, tool_name)
+
+
+def _safe_emit(on_event: Optional[EventSink]) -> EventSink:
+    """Обёртка, чтобы исключение в репортере не валило tool-loop.
+
+    UI-сторона не должна влиять на корректность бизнес-логики.
+    """
+    if on_event is None:
+        return lambda _ev: None
+    def _wrapped(ev: dict) -> None:
+        try:
+            on_event(ev)
+        except Exception:
+            pass
+    return _wrapped

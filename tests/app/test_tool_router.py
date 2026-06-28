@@ -267,6 +267,66 @@ def test_max_iterations_trunc_returns_truncated_flag():
     assert len(result.trace) == 3
 
 
+def test_on_event_streams_thinking_and_tool_events_in_order():
+    """Репортер видит события в правильном порядке: думаю → tool_start → tool_end → ...
+    Это контракт, на котором держится live-прогресс в CLI."""
+    fs = FakeMcpClient(server_id="fs", tools=[_tool("fs", "ls")], responses={"ls": "a b"})
+    registry = FakeRegistry(by_id={"fs": fs})
+    llm = FakeLLM(script=[
+        {"content": None, "tool_calls": [_tool_call("c1", "fs__ls", {"path": "/x"})]},
+        {"content": "готово"},
+    ])
+    router = ToolRouter(llm, registry)
+    events = []
+    router.chat([{"role": "user", "content": "?"}], {"model": "m"},
+                on_event=lambda ev: events.append(ev))
+
+    types = [e["type"] for e in events]
+    # 2 итерации = 2 thinking_start + 2 thinking_end + 1 tool_start + 1 tool_end
+    assert types == [
+        "thinking_start", "thinking_end",
+        "tool_start", "tool_end",
+        "thinking_start", "thinking_end",
+    ]
+    # tool_start содержит распарсенные аргументы и server/tool до диспетча.
+    ts = next(e for e in events if e["type"] == "tool_start")
+    assert ts["server_id"] == "fs"
+    assert ts["tool_name"] == "ls"
+    assert ts["arguments"] == {"path": "/x"}
+    # tool_end несёт ту же ToolInvocation, что и в trace.
+    te = next(e for e in events if e["type"] == "tool_end")
+    assert te["invocation"].server_id == "fs"
+    assert te["invocation"].result_text == "a b"
+
+
+def test_on_event_works_when_no_tools():
+    """Даже без тулов — события think_start/think_end должны прийти,
+    чтобы CLI знал, что показывать спиннер."""
+    registry = FakeRegistry(by_id={})
+    llm = FakeLLM(script=[{"content": "ответ"}])
+    router = ToolRouter(llm, registry)
+    events = []
+    router.chat([{"role": "user", "content": "?"}], {"model": "m"},
+                on_event=lambda ev: events.append(ev))
+    assert [e["type"] for e in events] == ["thinking_start", "thinking_end"]
+
+
+def test_on_event_exception_does_not_break_loop():
+    """Сбой в репортере не должен ронять весь чат."""
+    fs = FakeMcpClient(server_id="fs", tools=[_tool("fs", "x")], responses={"x": "ok"})
+    registry = FakeRegistry(by_id={"fs": fs})
+    llm = FakeLLM(script=[
+        {"content": None, "tool_calls": [_tool_call("c", "fs__x", {})]},
+        {"content": "done"},
+    ])
+    def buggy(ev): raise RuntimeError("ui exploded")
+    router = ToolRouter(llm, registry)
+    # не должно бросить
+    result = router.chat([{"role": "user", "content": "?"}], {"model": "m"}, on_event=buggy)
+    assert result.reply == "done"
+    assert len(result.trace) == 1
+
+
 def test_collect_openai_tools_uses_qualified_names_and_schemas():
     """Имена тулов уходят в LLM как server__tool, схемы — как parameters."""
     schema = {"type": "object",
