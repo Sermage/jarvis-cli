@@ -23,6 +23,7 @@ from app.task_driver import (
     handle_plan_approval,
     handle_plan_revision,
 )
+from app.tool_router import ToolRouter
 from cli.ansi import BOLD, CLEAR_SCREEN, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW
 from cli.config import (
     ACTIVE_TASK_FILE,
@@ -37,6 +38,7 @@ from cli.config import (
     INVARIANTS_DIR,
     KNOWLEDGE_DIR,
     MAX_SESSIONS,
+    MCP_CONFIG_FILE,
     PROFILES_DIR,
     TASKS_DIR,
     WORKING_DIR,
@@ -46,6 +48,7 @@ from cli.config import (
 )
 from cli.invariant_commands import handle_inv
 from cli.know_commands import handle_know
+from cli.mcp_commands import handle_mcp
 from cli.profile_commands import (
     choose_profile,
     create_profile,
@@ -58,8 +61,14 @@ from cli.settings_commands import (
     set_max_tokens,
     set_temperature,
 )
+from cli.input_reader import (
+    disable_bracketed_paste,
+    enable_bracketed_paste,
+    read_input,
+)
 from cli.spinner import Spinner
 from cli.task_commands import handle_task
+from cli.tool_progress import ToolProgressReporter
 from cli.views import (
     announce_guard_result,
     announce_task_transitions,
@@ -77,6 +86,8 @@ from infra.deepseek_client import DeepSeekClient
 from infra.gigachat_client import RequestsGigaChatClient
 from infra.invariant_repository import FileInvariantRepository
 from infra.knowledge_repository import FileKnowledgeRepository
+from infra.mcp_config_repository import FileMcpConfigRepository
+from infra.mcp_registry import StdioMcpRegistry
 from infra.profile_repository import FileProfileRepository
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
@@ -137,12 +148,35 @@ def main():
     profile_repo   = FileProfileRepository(PROFILES_DIR)
     knowledge_repo = FileKnowledgeRepository(KNOWLEDGE_DIR)
     invariant_repo = FileInvariantRepository(INVARIANTS_DIR)
+    mcp_repo       = FileMcpConfigRepository(MCP_CONFIG_FILE)
 
     print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}")
     print(f"{DIM}провайдер: {provider}{RESET}\n")
 
     client       = _build_client(provider)
     orchestrator = build_default_orchestrator(task_repo)
+
+    # MCP: поднимаем все включённые серверы. Если ни одного — registry просто
+    # пуст, и ToolRouter будет проксировать chat() без tool-loop.
+    mcp_registry = StdioMcpRegistry(mcp_repo)
+    if mcp_repo.list_all():
+        with Spinner("Поднимаю MCP-серверы..."):
+            mcp_registry.start_all()
+        running = mcp_registry.clients()
+        if running:
+            tools_count = len(mcp_registry.all_tools())
+            print(f"{DIM}MCP: запущено {len(running)} серверов, "
+                  f"обнаружено {tools_count} тулов.{RESET}")
+        for sid, err in mcp_registry.failures():
+            print(f"{YELLOW}MCP[{sid}] не стартовал: {err}{RESET}")
+
+    tool_router = ToolRouter(client, mcp_registry) \
+        if provider == DEEPSEEK and mcp_registry.all_tools() else None
+    if tool_router is not None:
+        print(f"{DIM}Tool-loop активен (provider=deepseek).{RESET}\n")
+    elif provider != DEEPSEEK and mcp_repo.list_all():
+        print(f"{YELLOW}MCP-серверы настроены, но tool calling доступен только "
+              f"для DeepSeek. Переключи /provider deepseek.{RESET}\n")
 
     # Инициализация долговременной памяти
     current_profile: Optional[Profile] = profile_repo.ensure_default()
@@ -201,9 +235,20 @@ def main():
     print_memory_status(messages, wm, task_repo, current_profile, knowledge_repo)
     print()
 
+    # Гарантируем остановку MCP-подпроцессов даже при падении или Ctrl+C
+    # во время работы тула.
+    import atexit
+    atexit.register(mcp_registry.shutdown)
+
+    # Включаем bracketed paste, чтобы многострочный paste не отправлялся
+    # на первом же \n — REPL увидит вставку как одно сообщение и подождёт
+    # явный Enter после неё.
+    enable_bracketed_paste()
+    atexit.register(disable_bracketed_paste)
+
     while True:
         try:
-            user_input = input(f"{BOLD}{CYAN}You:{RESET} ").strip()
+            user_input = read_input(f"{BOLD}{CYAN}You:{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Выход.{RESET}")
             break
@@ -225,8 +270,15 @@ def main():
                     provider = new_provider
                     params["model"] = default_model_for(provider)
                     client = _build_client(provider)
+                    tool_router = ToolRouter(client, mcp_registry) \
+                        if provider == DEEPSEEK and mcp_registry.all_tools() else None
                     print(f"{GREEN}Провайдер переключён: {provider}{RESET}")
                     print(f"{DIM}модель сброшена на дефолт: {params['model']}{RESET}")
+                    if tool_router is not None:
+                        print(f"{DIM}Tool-loop активен.{RESET}")
+                    elif mcp_registry.all_tools():
+                        print(f"{YELLOW}Tool calling доступен только для DeepSeek — "
+                              f"MCP-тулы временно отключены.{RESET}")
             elif cmd == "/temp":
                 set_temperature(params)
             elif cmd == "/tokens":
@@ -247,6 +299,8 @@ def main():
                             orchestrator=orchestrator)
             elif cmd.startswith("/inv"):
                 handle_inv(user_input, invariant_repo)
+            elif cmd.startswith("/mcp"):
+                handle_mcp(user_input, mcp_repo, mcp_registry)
             elif cmd == "/profile new":
                 current_profile = create_profile(profile_repo, current_profile)
             elif cmd == "/profile edit":
@@ -375,10 +429,22 @@ def main():
             invariant_repo,
         )
 
+        loop = None
+        guarded = None
+        reporter = ToolProgressReporter() if tool_router is not None else None
         try:
-            with Spinner("Думаю..."):
-                guarded = guarded_chat(client, messages, params, system_prompt,
-                                       invariant_repo.load_all(), max_retries=1)
+            if tool_router is not None:
+                # ToolProgressReporter сам ведёт спиннер «Думаю...» и печатает
+                # каждый tool_call вживую — внешний Spinner здесь не нужен.
+                try:
+                    loop = tool_router.chat(messages, params, system_prompt,
+                                            on_event=reporter)
+                finally:
+                    reporter.stop()
+            else:
+                with Spinner("Думаю..."):
+                    guarded = guarded_chat(client, messages, params, system_prompt,
+                                           invariant_repo.load_all(), max_retries=1)
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
             try:
@@ -401,9 +467,17 @@ def main():
             messages.pop()
             continue
 
-        reply = guarded.reply
-        print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
-        announce_guard_result(guarded)
+        if loop is not None:
+            # Цепочка tool_call'ов уже распечатана live через reporter,
+            # повторно её показывать не нужно.
+            reply = loop.reply
+            if loop.truncated:
+                print(f"{YELLOW}[!] tool-loop обрезан по лимиту итераций{RESET}")
+            print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
+        else:
+            reply = guarded.reply
+            print(f"{BOLD}{GREEN}Agent:{RESET} {reply}")
+            announce_guard_result(guarded)
 
         # Краткосрочная память: сохраняем ответ ассистента
         messages.append({"role": "assistant", "content": reply})

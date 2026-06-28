@@ -9,14 +9,19 @@ import inspect
 from app.ports import (
     KnowledgeRepository,
     LLMClient,
+    McpConfigRepository,
+    McpRegistry,
     ProfileRepository,
     SessionRepository,
     TaskRepository,
+    ToolCallingLLMClient,
     WorkingMemoryRepository,
 )
 from infra.deepseek_client import DeepSeekClient
 from infra.gigachat_client import RequestsGigaChatClient
 from infra.knowledge_repository import FileKnowledgeRepository
+from infra.mcp_config_repository import FileMcpConfigRepository
+from infra.mcp_registry import StdioMcpRegistry
 from infra.profile_repository import FileProfileRepository
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
@@ -73,3 +78,22 @@ def test_file_knowledge_repository_covers_port(tmp_path):
     repo = FileKnowledgeRepository(dir_path=str(tmp_path / "knowledge"))
     for name in _methods(KnowledgeRepository):
         assert callable(getattr(repo, name)), f"missing method: {name}"
+
+
+def test_file_mcp_config_repository_covers_port(tmp_path):
+    repo = FileMcpConfigRepository(file_path=str(tmp_path / "mcp.json"))
+    for name in _methods(McpConfigRepository):
+        assert callable(getattr(repo, name)), f"missing method: {name}"
+
+
+def test_stdio_mcp_registry_covers_port(tmp_path):
+    repo = FileMcpConfigRepository(file_path=str(tmp_path / "mcp.json"))
+    reg = StdioMcpRegistry(repo)
+    for name in _methods(McpRegistry):
+        assert callable(getattr(reg, name)), f"missing method: {name}"
+
+
+def test_deepseek_client_covers_tool_calling_port():
+    client = DeepSeekClient(api_key="k", chat_url="https://api.deepseek.com/chat/completions")
+    for name in _methods(ToolCallingLLMClient):
+        assert callable(getattr(client, name)), f"missing method: {name}"

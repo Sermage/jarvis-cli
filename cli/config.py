@@ -92,5 +92,7 @@ WORKING_DIR      = os.path.expanduser("~/.jarvis/working")
 KNOWLEDGE_DIR    = os.path.expanduser("~/.jarvis/knowledge")
 TASKS_DIR        = os.path.expanduser("~/.jarvis/tasks")
 INVARIANTS_DIR   = os.path.expanduser("~/.jarvis/invariants")
+MCP_DIR          = os.path.expanduser("~/.jarvis/mcp")
+MCP_CONFIG_FILE  = os.path.join(MCP_DIR, "servers.json")
 ACTIVE_TASK_FILE = os.path.join(TASKS_DIR, "active")
 MAX_SESSIONS     = 20
