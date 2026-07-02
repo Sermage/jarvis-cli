@@ -26,7 +26,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from app.system_prompt import build_system_prompt
+from app.retrieval_pipeline import RetrievalPipeline
+from app.system_prompt import build_system_prompt, format_rag_block
 from cli.config import (
     DEFAULT_EMBED_MODEL,
     DEFAULT_OLLAMA_URL,
@@ -37,8 +38,11 @@ from cli.config import (
     resolve_provider,
 )
 from cli.main import _build_client
+from domain.retrieval import RetrievalConfig
 from domain.working_memory import WorkingMemory
+from infra.query_rewriter import LLMQueryRewriter
 from infra.rag_retrieval import FaissOllamaRetrievalEngine
+from infra.rerankers import HeuristicReranker, LLMReranker
 
 
 class _EmptyKnowledge:
@@ -133,6 +137,101 @@ def build_full_context(meta_path: str, budget_chars: int):
     return _FULL_CTX_HEADER + "".join(parts), used, total, files_used, len(order)
 
 
+def _first_expected_rank(chunks, expected_sources) -> int:
+    """1-based позиция первого чанка из ожидаемого источника (0 = не найден).
+
+    Детерминированная метрика качества retrieval: не зависит от генерации
+    ответа (в отличие от keywords/judge), поэтому надёжно ловит эффект реранка.
+    """
+    for i, c in enumerate(chunks, 1):
+        if any(e in c.source or c.source in e for e in expected_sources):
+            return i
+    return 0
+
+
+def run_compare_modes(args, client, params, base_engine, questions, top_k):
+    """Сравнить ступени улучшенного RAG на одном наборе вопросов.
+
+    Четыре режима поверх одного базового поиска:
+      baseline — как исходный RAG: top_k напрямую, без фильтра/реранка/rewrite;
+      +filter  — fetch_k кандидатов → порог min_score → top_k;
+      +rerank  — то же + переупорядочивание выбранным реранкером;
+      improved — то же + query rewrite перед поиском.
+
+    Основная метрика — детерминированные hit@k и MRR (ранг ожидаемого источника):
+    они изолируют качество retrieval от шума генерации. keywords/judge считаются
+    только с флагом судьи (--no-judge выключает генерацию ответов вовсе — тогда
+    прогон быстрый, бесплатный и полностью воспроизводимый).
+    """
+    K, F, T, RR = top_k, args.fetch_k, args.min_score, args.reranker
+    judged = not args.no_judge
+    rerankers = {"heuristic": HeuristicReranker(), "llm": LLMReranker(client, params)}
+    rewriter = LLMQueryRewriter(client, params)
+
+    def pipe(fetch_k, min_score, reranker, rewrite):
+        cfg = RetrievalConfig(top_k=K, fetch_k=fetch_k, min_score=min_score,
+                              reranker=reranker, rewrite=rewrite)
+        return RetrievalPipeline(base_engine, cfg, rewriter=rewriter, rerankers=rerankers)
+
+    modes = [
+        ("baseline", pipe(K, 0.0, "none", False)),
+        ("+filter",  pipe(F, T, "none", False)),
+        (f"+rerank({RR})", pipe(F, T, RR, False)),
+        ("improved", pipe(F, T, RR, True)),
+    ]
+
+    print(f"Модель: {params['model']} · реранкер: {RR} · "
+          f"fetch_k={F} · порог={T} · top_k={K} · "
+          f"судья: {'да' if judged else 'нет (только retrieval)'}\n")
+    print(f"Режимы: baseline (top_k напрямую) → +filter (порог) → "
+          f"+rerank → improved (+ query rewrite)\n")
+
+    agg = {name: {"hit": 0, "rr": 0.0, "kw": 0.0, "j": [], "n_chunks": 0}
+           for name, _ in modes}
+    for q in questions:
+        qtext, exp = q["question"], q["expectation"]
+        exp_src = q.get("expected_sources", [])
+        exp_kw = q.get("expected_keywords", [])
+        print(f"── {q['id']} ──  {qtext}")
+        for name, pl in modes:
+            chunks = pl.retrieve(qtext, top_k=K)
+            rank = _first_expected_rank(chunks, exp_src)
+            hit = rank > 0
+            a = agg[name]
+            a["hit"] += int(hit); a["rr"] += (1.0 / rank if rank else 0.0)
+            a["n_chunks"] += len(chunks)
+            srcs = ", ".join(sorted({c.source for c in chunks})) or "—"
+            line = (f"   {name:<16} hit@{K}={'Y' if hit else '·'}  "
+                    f"rank={rank or '—':<2} chunks={len(chunks):<2}")
+            if judged:
+                answer = ask(client, params, qtext, format_rag_block(chunks) if chunks else None)
+                kw = keyword_coverage(answer, exp_kw)
+                j = judge(client, params, qtext, exp, answer)
+                a["kw"] += kw
+                if j >= 0:
+                    a["j"].append(j)
+                line += f"  kw={kw:>4.0%}  judge={j}"
+            print(line + f"  [{srcs}]")
+        print()
+
+    n = len(questions)
+    print("=" * 70)
+    print(f"СВОДКА ПО РЕЖИМАМ  ({n} вопросов, реранкер={RR})")
+    header = f"  {'режим':<16} {'hit@k':>6} {'MRR':>6} {'ср.чанков':>10}"
+    if judged:
+        header += f" {'keywords':>9} {'judge':>7}"
+    print(header)
+    for name, _ in modes:
+        a = agg[name]
+        row = (f"  {name:<16} {a['hit']/n:>6.0%} {a['rr']/n:>6.2f} "
+               f"{a['n_chunks']/n:>10.1f}")
+        if judged:
+            jv = f"{sum(a['j'])/len(a['j']):.2f}" if a["j"] else "—"
+            row += f" {a['kw']/n:>9.0%} {jv:>7}"
+        print(row)
+    print("=" * 70)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-judge", action="store_true", help="не звать LLM-судью")
@@ -149,6 +248,14 @@ def main():
                     help="empty — вопрос без контекста; full — весь репозиторий в промпт")
     ap.add_argument("--context-chars", type=int, default=200000,
                     help="лимит символов full-context промпта (грубо ~64K токенов)")
+    ap.add_argument("--compare-modes", action="store_true",
+                    help="сравнить ступени RAG: baseline → +filter → +rerank → improved")
+    ap.add_argument("--reranker", choices=["heuristic", "llm"], default="heuristic",
+                    help="реранкер для режимов +rerank/improved (--compare-modes)")
+    ap.add_argument("--fetch-k", type=int, default=20,
+                    help="сколько кандидатов брать до фильтра/реранка (--compare-modes)")
+    ap.add_argument("--min-score", type=float, default=0.4,
+                    help="порог отсечения по близости для +filter/+rerank (--compare-modes)")
     args = ap.parse_args()
 
     load_env(os.path.join(REPO_ROOT, ".env"))
@@ -177,6 +284,11 @@ def main():
         questions = json.load(f)
     if args.limit:
         questions = questions[:args.limit]
+
+    # Режим сравнения ступеней улучшенного RAG (второй этап задания).
+    if args.compare_modes:
+        run_compare_modes(args, client, params, engine, questions, rag_cfg.top_k)
+        return
 
     # Базовый режim: пустой промпт или весь репозиторий (full-context).
     base_label = "full-context" if args.baseline == "full" else "без RAG"

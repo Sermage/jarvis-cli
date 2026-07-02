@@ -85,6 +85,7 @@ from cli.views import (
 )
 from cli.wm_commands import handle_wm
 from app.ports import LLMClient
+from app.retrieval_pipeline import RetrievalPipeline
 from domain.profile import Profile
 from infra.deepseek_client import DeepSeekClient
 from infra.gigachat_client import RequestsGigaChatClient
@@ -93,7 +94,9 @@ from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
 from infra.mcp_registry import StdioMcpRegistry
 from infra.profile_repository import FileProfileRepository
+from infra.query_rewriter import LLMQueryRewriter
 from infra.rag_retrieval import FaissOllamaRetrievalEngine
+from infra.rerankers import HeuristicReranker, LLMReranker
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
 from infra.working_memory_repository import FileWorkingMemoryRepository
@@ -155,21 +158,38 @@ def main():
     invariant_repo = FileInvariantRepository(INVARIANTS_DIR)
     mcp_repo       = FileMcpConfigRepository(MCP_CONFIG_FILE)
 
-    # RAG: движок поиска по индексу документов (порт RetrievalEngine).
+    print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}")
+    print(f"{DIM}провайдер: {provider}{RESET}\n")
+
+    client       = _build_client(provider)
+
+    # RAG: многоступенчатый пайплайн поверх FAISS-индекса.
+    #   query rewrite → поиск (fetch_k) → порог min_score → реранк → top_k.
+    # Базовый движок и пайплайн реализуют один порт RetrievalEngine, поэтому
+    # build_system_prompt о ступенях не знает. Реранкеры/rewriter строятся здесь
+    # (после client), т.к. LLM-варианты требуют клиент модели. temperature=0 —
+    # чтобы вспомогательные вызовы были детерминированными.
     rag_config = load_rag_config()
-    rag_engine = FaissOllamaRetrievalEngine(
+    rag_base_engine = FaissOllamaRetrievalEngine(
         index_path  = rag_config.index_path,
         strategy    = rag_config.strategy,
         embed_model = DEFAULT_EMBED_MODEL,
         ollama_url  = DEFAULT_OLLAMA_URL,
     )
+    aux_params = dict(params)
+    aux_params["temperature"] = 0
+    rag_engine = RetrievalPipeline(
+        rag_base_engine,
+        rag_config,
+        rewriter=LLMQueryRewriter(client, aux_params),
+        rerankers={
+            "heuristic": HeuristicReranker(),
+            "llm": LLMReranker(client, aux_params),
+        },
+    )
     if rag_config.enabled and not rag_engine.is_ready():
         rag_config.enabled = False  # индекс/зависимости недоступны — тихо в обычный режим
 
-    print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}")
-    print(f"{DIM}провайдер: {provider}{RESET}\n")
-
-    client       = _build_client(provider)
     orchestrator = build_default_orchestrator(task_repo)
 
     # MCP: поднимаем все включённые серверы. Если ни одного — registry просто
@@ -250,9 +270,11 @@ def main():
     print_settings(params, current_profile)
     print_memory_status(messages, wm, task_repo, current_profile, knowledge_repo)
     if rag_config.enabled:
+        rw = "on" if rag_config.rewrite else "off"
         print(f"{DIM}RAG: включён (индекс {rag_config.index_path}, "
-              f"стратегия {rag_config.strategy}, top_k={rag_config.top_k}). "
-              f"Переключить — /rag off.{RESET}")
+              f"стратегия {rag_config.strategy}, top_k={rag_config.top_k}, "
+              f"реранк={rag_config.reranker}, rewrite={rw}). "
+              f"Настройки — /rag status, выключить — /rag off.{RESET}")
     elif rag_engine.is_ready():
         print(f"{DIM}RAG: индекс найден, но выключен. Включить — /rag on.{RESET}")
     print()
