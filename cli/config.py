@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-from domain.retrieval import RetrievalConfig
+from domain.retrieval import RERANKERS, RetrievalConfig
 
 
 def load_env(env_path: str) -> None:
@@ -104,20 +104,48 @@ MAX_SESSIONS     = 20
 DEFAULT_RAG_INDEX_PATH = os.path.expanduser("~/rag-kotlin/index")
 DEFAULT_RAG_STRATEGY   = "structural"
 DEFAULT_RAG_TOP_K      = 5
+DEFAULT_RAG_FETCH_K    = 20
+DEFAULT_RAG_MIN_SCORE  = 0.0
+DEFAULT_RAG_RERANKER   = "heuristic"
+DEFAULT_RAG_REWRITE    = False
 DEFAULT_EMBED_MODEL    = "bge-m3"
 DEFAULT_OLLAMA_URL     = "http://localhost:11434"
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "да")
+
+
 def load_rag_config() -> RetrievalConfig:
     """Собрать конфиг RAG из окружения (.env уже должен быть подгружен)."""
-    enabled = os.environ.get("RAG_ENABLED", "").strip().lower() in ("1", "true", "yes", "да")
     index_path = os.path.expanduser(
         os.environ.get("RAG_INDEX_PATH", "").strip() or DEFAULT_RAG_INDEX_PATH
     )
     strategy = os.environ.get("RAG_STRATEGY", "").strip() or DEFAULT_RAG_STRATEGY
-    try:
-        top_k = int(os.environ.get("RAG_TOP_K", "").strip() or DEFAULT_RAG_TOP_K)
-    except ValueError:
-        top_k = DEFAULT_RAG_TOP_K
-    return RetrievalConfig(enabled=enabled, index_path=index_path,
-                           strategy=strategy, top_k=top_k)
+    reranker = (os.environ.get("RAG_RERANKER", "").strip().lower() or DEFAULT_RAG_RERANKER)
+    if reranker not in RERANKERS:
+        reranker = DEFAULT_RAG_RERANKER
+    return RetrievalConfig(
+        enabled=_env_bool("RAG_ENABLED"),
+        index_path=index_path,
+        strategy=strategy,
+        top_k=_env_int("RAG_TOP_K", DEFAULT_RAG_TOP_K),
+        fetch_k=_env_int("RAG_FETCH_K", DEFAULT_RAG_FETCH_K),
+        min_score=_env_float("RAG_MIN_SCORE", DEFAULT_RAG_MIN_SCORE),
+        reranker=reranker,
+        rewrite=_env_bool("RAG_REWRITE") if os.environ.get("RAG_REWRITE") else DEFAULT_RAG_REWRITE,
+    )
