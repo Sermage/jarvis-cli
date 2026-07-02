@@ -307,9 +307,13 @@ def print_help() -> None:
   {CYAN}/know show <имя>{RESET} — показать запись
 
 {BOLD}{BLUE}RAG — поиск по базе документов (/rag):{RESET}
-  {CYAN}/rag{RESET}            — статус RAG-режима (индекс, стратегия, top_k)
-  {CYAN}/rag on{RESET}         — включить: к вопросу подмешивается контекст из базы
-  {CYAN}/rag off{RESET}        — выключить: обычный чат без базы
+  {CYAN}/rag{RESET}                  — статус: весь конвейер (rewrite→fetch→порог→реранк→top_k)
+  {CYAN}/rag on · off{RESET}         — включить/выключить подмешивание контекста из базы
+  {CYAN}/rag reranker <m>{RESET}     — реранкер: none · heuristic · llm
+  {CYAN}/rag rewrite on·off{RESET}   — переформулировка запроса через LLM перед поиском
+  {CYAN}/rag threshold <x>{RESET}    — порог отсечения по близости (0 — выключить)
+  {CYAN}/rag fetchk <n>{RESET}       — сколько кандидатов брать до фильтра/реранка
+  {CYAN}/rag topk <n>{RESET}         — сколько чанков оставлять после реранка
 
 {BOLD}{MAGENTA}Инварианты (/inv):{RESET}
   {CYAN}/inv list{RESET}        — список нерушимых ограничений проекта
