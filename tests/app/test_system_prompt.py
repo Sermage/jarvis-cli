@@ -164,11 +164,33 @@ def test_rag_absent_when_not_ready():
     assert "RAG" not in prompt
 
 
-def test_rag_absent_when_no_hits():
+def test_weak_context_block_when_no_hits():
+    # Пустой результат поиска (всё ниже порога) → блок-инструкция «не знаю»,
+    # а не тихий ответ из общих знаний.
     eng = FakeRetrievalEngine([])
     prompt = build_system_prompt("проф", WorkingMemory(), FakeKnowledgeRepo(),
                                  retrieval_engine=eng, user_query="q")
-    assert "RAG" not in prompt
+    assert "РЕЛЕВАНТНОГО КОНТЕКСТА НЕ НАЙДЕНО" in prompt
+    assert "Не знаю" in prompt
+
+
+def test_weak_context_block_absent_when_hits_present():
+    eng = FakeRetrievalEngine([RetrievedChunk(text="ctx", source="s.md")])
+    prompt = build_system_prompt("проф", WorkingMemory(), FakeKnowledgeRepo(),
+                                 retrieval_engine=eng, user_query="q")
+    assert "НЕ НАЙДЕНО" not in prompt
+
+
+def test_rag_block_shows_chunk_id_and_citation_format():
+    eng = FakeRetrievalEngine([
+        RetrievedChunk(text="ctx text", source="docs/a.md",
+                       section="Раздел", chunk_id="a.md#3"),
+    ])
+    prompt = build_system_prompt(None, WorkingMemory(), FakeKnowledgeRepo(),
+                                 retrieval_engine=eng, user_query="q")
+    assert "a.md#3" in prompt          # chunk_id доступен для цитирования
+    assert "Источники:" in prompt      # обязательный формат ответа задан
+    assert "Цитаты:" in prompt
 
 
 def test_rag_passes_top_k_through():

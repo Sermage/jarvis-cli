@@ -311,7 +311,7 @@ def print_help() -> None:
   {CYAN}/rag on · off{RESET}         — включить/выключить подмешивание контекста из базы
   {CYAN}/rag reranker <m>{RESET}     — реранкер: none · heuristic · llm
   {CYAN}/rag rewrite on·off{RESET}   — переформулировка запроса через LLM перед поиском
-  {CYAN}/rag threshold <x>{RESET}    — порог отсечения по близости (0 — выключить)
+  {CYAN}/rag threshold <x>{RESET}    — порог по близости (0 — выкл.); ниже порога → ответ «не знаю»
   {CYAN}/rag fetchk <n>{RESET}       — сколько кандидатов брать до фильтра/реранка
   {CYAN}/rag topk <n>{RESET}         — сколько чанков оставлять после реранка
 
