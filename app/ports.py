@@ -12,6 +12,7 @@ from domain.invariant import Invariant, InvariantSet
 from domain.knowledge import KnowledgeEntry
 from domain.mcp import McpServerConfig, McpTool, ToolResult
 from domain.profile import Profile
+from domain.retrieval import RetrievedChunk
 from domain.task import Task
 from domain.working_memory import WorkingMemory
 
@@ -77,6 +78,22 @@ class ToolCallingLLMClient(LLMClient, Protocol):
                         params: dict,
                         tools: list,
                         system_prompt: Optional[str] = None) -> dict: ...
+
+
+class RetrievalEngine(Protocol):
+    """Поиск релевантных фрагментов в индексе документов (RAG).
+
+    Реализация (`infra/`) владеет чтением индекса и обращением к
+    эмбеддинг-модели; `app/` знает только об этом протоколе.
+    """
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[RetrievedChunk]:
+        """Вернуть top_k наиболее близких к запросу фрагментов."""
+        ...
+
+    def is_ready(self) -> bool:
+        """Готов ли движок (индекс на месте, зависимости доступны)."""
+        ...
 
 
 class McpClient(Protocol):

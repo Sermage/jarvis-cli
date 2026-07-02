@@ -1,0 +1,72 @@
+[
+  {
+    "id": "j01-providers",
+    "question": "Какие LLM-провайдеры поддерживает jarvis-cli и какой используется по умолчанию?",
+    "expectation": "Поддерживаются два провайдера — DeepSeek (по умолчанию) и GigaChat; выбор через LLM_PROVIDER или команду /provider.",
+    "expected_keywords": ["deepseek", "gigachat"],
+    "expected_sources": ["README.md", "cli_config.py", "CLAUDE.md"]
+  },
+  {
+    "id": "j02-llmclient-method",
+    "question": "Как называется метод порта LLMClient для запроса к модели и какие у него параметры?",
+    "expectation": "Метод chat(messages, params, system_prompt) возвращает строку с ответом ассистента.",
+    "expected_keywords": ["chat", "messages", "system_prompt"],
+    "expected_sources": ["ports.py"]
+  },
+  {
+    "id": "j03-memory-layers",
+    "question": "Сколько слоёв в модели памяти jarvis и какие это слои?",
+    "expectation": "Три слоя: краткосрочная (диалог/сессии), рабочая (задача/контекст/заметки) и долговременная (профиль + база знаний).",
+    "expected_keywords": ["кратк", "рабоч", "долговремен"],
+    "expected_sources": ["CLAUDE.md", "README.md"]
+  },
+  {
+    "id": "j04-composition-root",
+    "question": "В каком файле jarvis собирается граф зависимостей (composition root)?",
+    "expectation": "В cli/main.py — там создаются конкретные реализации портов и прокидываются в use cases.",
+    "expected_keywords": ["main.py"],
+    "expected_sources": ["CLAUDE.md"]
+  },
+  {
+    "id": "j05-guarded-chat",
+    "question": "Что делает функция guarded_chat и в каком модуле она объявлена?",
+    "expectation": "Пост-проверка ответа модели против инвариантов с feedback-ретраем при block-нарушениях; объявлена в app/invariant_guard.py.",
+    "expected_keywords": ["invariant_guard", "инвариант", "ретрай"],
+    "expected_sources": ["invariant_guard.py", "CLAUDE.md"]
+  },
+  {
+    "id": "j06-invariants-storage",
+    "question": "Что такое инварианты в jarvis и где они хранятся на диске?",
+    "expectation": "Нерушимые ограничения проекта; хранятся в ~/.jarvis/invariants/<id>.json, по одному файлу на инвариант.",
+    "expected_keywords": ["~/.jarvis/invariants", "ограничени"],
+    "expected_sources": ["CLAUDE.md"]
+  },
+  {
+    "id": "j07-runtime-dependency",
+    "question": "Какая единственная обязательная runtime-зависимость у jarvis?",
+    "expectation": "Только requests — остальное из стандартной библиотеки.",
+    "expected_keywords": ["requests"],
+    "expected_sources": ["CLAUDE.md", "README.md"]
+  },
+  {
+    "id": "j08-user-data-dir",
+    "question": "В каком каталоге jarvis хранит все пользовательские данные?",
+    "expectation": "В ~/.jarvis/ (сессии, профили, рабочая память, знания, задачи, инварианты, mcp).",
+    "expected_keywords": ["~/.jarvis"],
+    "expected_sources": ["CLAUDE.md", "cli_config.py"]
+  },
+  {
+    "id": "j09-switch-provider",
+    "question": "Какой командой переключить LLM-провайдера прямо в REPL?",
+    "expectation": "Командой /provider (также можно задать через переменную окружения LLM_PROVIDER).",
+    "expected_keywords": ["/provider"],
+    "expected_sources": ["README.md", "CLAUDE.md"]
+  },
+  {
+    "id": "j10-system-prompt-parts",
+    "question": "Из каких частей build_system_prompt собирает системный промпт?",
+    "expectation": "Из профиля, блока инвариантов, (опционально) RAG-контекста, базы знаний и рабочей памяти.",
+    "expected_keywords": ["профил", "инвариант", "рабоч"],
+    "expected_sources": ["system_prompt.py", "CLAUDE.md"]
+  }
+]

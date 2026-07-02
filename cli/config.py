@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 
+from domain.retrieval import RetrievalConfig
+
 
 def load_env(env_path: str) -> None:
     """Подтянуть переменные из .env в os.environ (без перезаписи существующих)."""
@@ -96,3 +98,26 @@ MCP_DIR          = os.path.expanduser("~/.jarvis/mcp")
 MCP_CONFIG_FILE  = os.path.join(MCP_DIR, "servers.json")
 ACTIVE_TASK_FILE = os.path.join(TASKS_DIR, "active")
 MAX_SESSIONS     = 20
+
+# ── RAG ─────────────────────────────────────────────────────────────────────
+
+DEFAULT_RAG_INDEX_PATH = os.path.expanduser("~/rag-kotlin/index")
+DEFAULT_RAG_STRATEGY   = "structural"
+DEFAULT_RAG_TOP_K      = 5
+DEFAULT_EMBED_MODEL    = "bge-m3"
+DEFAULT_OLLAMA_URL     = "http://localhost:11434"
+
+
+def load_rag_config() -> RetrievalConfig:
+    """Собрать конфиг RAG из окружения (.env уже должен быть подгружен)."""
+    enabled = os.environ.get("RAG_ENABLED", "").strip().lower() in ("1", "true", "yes", "да")
+    index_path = os.path.expanduser(
+        os.environ.get("RAG_INDEX_PATH", "").strip() or DEFAULT_RAG_INDEX_PATH
+    )
+    strategy = os.environ.get("RAG_STRATEGY", "").strip() or DEFAULT_RAG_STRATEGY
+    try:
+        top_k = int(os.environ.get("RAG_TOP_K", "").strip() or DEFAULT_RAG_TOP_K)
+    except ValueError:
+        top_k = DEFAULT_RAG_TOP_K
+    return RetrievalConfig(enabled=enabled, index_path=index_path,
+                           strategy=strategy, top_k=top_k)
