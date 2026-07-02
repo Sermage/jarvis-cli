@@ -1,0 +1,72 @@
+[
+  {
+    "id": "q01-secondary-constructor",
+    "question": "Как в Kotlin объявить вторичный конструктор класса?",
+    "expectation": "Через ключевое слово constructor внутри тела класса; вторичный конструктор должен делегировать первичному через this(...).",
+    "expected_keywords": ["constructor", "this"],
+    "expected_sources": ["docs/classes.md"]
+  },
+  {
+    "id": "q02-val-vs-var",
+    "question": "Чем отличается val от var?",
+    "expectation": "val — только для чтения (нельзя переприсвоить после инициализации), var — изменяемая переменная.",
+    "expected_keywords": ["val", "var", "чтения"],
+    "expected_sources": ["docs/basic-syntax.md", "docs/properties.md"]
+  },
+  {
+    "id": "q03-safe-call",
+    "question": "Как работает оператор безопасного вызова ?. и что он возвращает для null?",
+    "expectation": "?. вызывает член только если получатель не null, иначе всё выражение возвращает null.",
+    "expected_keywords": ["null", "?."],
+    "expected_sources": ["docs/null-safety.md"]
+  },
+  {
+    "id": "q04-sealed-class",
+    "question": "Для чего нужны sealed-классы и как они помогают в when?",
+    "expectation": "Ограничивают набор подтипов известным множеством; when по sealed-типу становится исчерпывающим и не требует else.",
+    "expected_keywords": ["when", "иерарх"],
+    "expected_sources": ["docs/sealed-classes.md"]
+  },
+  {
+    "id": "q05-data-class",
+    "question": "Что генерирует компилятор для data class?",
+    "expectation": "Автоматически генерирует equals(), hashCode(), toString(), copy() и componentN() для деструктуризации.",
+    "expected_keywords": ["equals", "hashCode", "toString", "copy"],
+    "expected_sources": ["docs/data-classes.md"]
+  },
+  {
+    "id": "q06-apply-vs-let",
+    "question": "Чем apply отличается от let среди scope-функций?",
+    "expectation": "apply получает объект как this и возвращает сам объект; let получает объект как it и возвращает результат лямбды.",
+    "expected_keywords": ["apply", "let", "this", "it"],
+    "expected_sources": ["docs/scope-functions.md"]
+  },
+  {
+    "id": "q07-generics-variance",
+    "question": "Что означает модификатор out у параметра типа в дженериках?",
+    "expectation": "out объявляет ковариантность: тип используется только на выход (producer), поэтому Foo<Derived> можно использовать как Foo<Base>.",
+    "expected_keywords": ["out", "ковариант", "producer"],
+    "expected_sources": ["docs/generics.md"]
+  },
+  {
+    "id": "q08-extension-function",
+    "question": "Что такое функция-расширение и как она диспетчеризуется?",
+    "expectation": "Позволяет добавить функцию к типу без наследования; расширения диспетчеризуются статически по объявленному типу получателя.",
+    "expected_keywords": ["расширени", "статич"],
+    "expected_sources": ["docs/extensions.md"]
+  },
+  {
+    "id": "q09-enum-with-properties",
+    "question": "Как объявить enum-класс, у констант которого есть свойства и значения?",
+    "expectation": "enum class с конструктором; каждая константа передаёт аргументы конструктору в скобках.",
+    "expected_keywords": ["enum", "constructor"],
+    "expected_sources": ["docs/enum-classes.md"]
+  },
+  {
+    "id": "q10-visibility-default",
+    "question": "Какая видимость у объявлений в Kotlin по умолчанию и какие есть модификаторы?",
+    "expectation": "По умолчанию public; доступны private, protected, internal и public.",
+    "expected_keywords": ["public", "private", "internal", "protected"],
+    "expected_sources": ["docs/visibility-modifiers.md"]
+  }
+]

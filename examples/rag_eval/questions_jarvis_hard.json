@@ -1,0 +1,72 @@
+[
+  {
+    "id": "h01-invariant-flow",
+    "question": "Как в обычном чате ответ модели проверяется на инварианты и что происходит при block-нарушении?",
+    "expectation": "cli/main.py вызывает guarded_chat (app/invariant_guard.py); тот прогоняет ответ через InvariantSet.check(), и при block-нарушении шлёт модели feedback и повторяет запрос (до max_retries).",
+    "expected_keywords": ["guarded_chat", "check", "retry"],
+    "expected_sources": ["app/invariant_guard.py", "cli/main.py"]
+  },
+  {
+    "id": "h02-message-path",
+    "question": "Опиши полный путь пользовательского сообщения от ввода в REPL до сохранения в сессию, с указанием функций.",
+    "expectation": "read_input → messages.append → build_system_prompt (профиль+инварианты+знания+WM) → guarded_chat/tool_router → печать ответа → session_repo.save в ~/.jarvis/sessions.",
+    "expected_keywords": ["build_system_prompt", "guarded_chat", "session"],
+    "expected_sources": ["cli/main.py", "app/system_prompt.py", "infra/session_repository.py"]
+  },
+  {
+    "id": "h03-tool-loop-activation",
+    "question": "При каких условиях активируется tool-loop (MCP) и что будет, если провайдер — gigachat?",
+    "expectation": "ToolRouter создаётся только если provider == deepseek и есть MCP-тулы; при gigachat tool calling недоступен, выводится предупреждение, идёт обычный chat.",
+    "expected_keywords": ["ToolRouter", "deepseek", "gigachat"],
+    "expected_sources": ["cli/main.py", "app/tool_router.py"]
+  },
+  {
+    "id": "h04-gigachat-oauth",
+    "question": "Как GigaChat-клиент получает и кэширует OAuth-токен?",
+    "expectation": "RequestsGigaChatClient делает OAuth-запрос за access_token с временем жизни, кэширует его и переиспользует до истечения, обновляя при необходимости.",
+    "expected_keywords": ["oauth", "токен", "кэш"],
+    "expected_sources": ["infra/gigachat_client.py"]
+  },
+  {
+    "id": "h05-toolrouter-loop",
+    "question": "Как ToolRouter разворачивает цикл tool_calls с MCP-серверами?",
+    "expectation": "Вызывает chat_with_tools, при наличии tool_calls исполняет их через MCP (call_tool), добавляет результаты как tool-сообщения и повторяет запрос к модели в цикле до финального ответа или лимита итераций.",
+    "expected_keywords": ["tool_calls", "call_tool", "итерац"],
+    "expected_sources": ["app/tool_router.py"]
+  },
+  {
+    "id": "h06-task-restore",
+    "question": "Как устроено восстановление активной задачи при старте jarvis?",
+    "expectation": "При старте task_repo.get_active() возвращает активную нетерминальную задачу; пользователю предлагают продолжить; учитывается awaiting (plan_approval / plan_revision_input / pending_questions).",
+    "expected_keywords": ["get_active", "awaiting", "plan_approval"],
+    "expected_sources": ["cli/main.py", "infra/task_repository.py", "domain/task.py"]
+  },
+  {
+    "id": "h07-task-transitions",
+    "question": "Как задача переходит между стадиями и какие метки в ответе модели триггерят переходы?",
+    "expectation": "advance_task двигает стадию; метки [VALIDATION OK] → done, [VALIDATION ISSUES] → execution, [QUESTION] → режим ожидания ответа; planning→execution по одобрению плана.",
+    "expected_keywords": ["VALIDATION", "QUESTION", "стади"],
+    "expected_sources": ["app/task_driver.py", "domain/task.py"]
+  },
+  {
+    "id": "h08-session-rotation",
+    "question": "Как хранятся и ротируются краткосрочные сессии?",
+    "expectation": "Каждая сессия — JSON-файл в ~/.jarvis/sessions; список сортируется от свежих к старым; при превышении MAX_SESSIONS (20) старые удаляются.",
+    "expected_keywords": ["session", "ротац", "json"],
+    "expected_sources": ["infra/session_repository.py"]
+  },
+  {
+    "id": "h09-rag-into-prompt",
+    "question": "Как RAG-контекст попадает в системный промпт и какой командой включить RAG-режим?",
+    "expectation": "build_system_prompt при переданном retrieval_engine и user_query вызывает retrieve и вставляет блок [КОНТЕКСТ ИЗ БАЗЫ] через format_rag_block; режим включается командой /rag on.",
+    "expected_keywords": ["/rag", "retrieval_engine", "format_rag_block"],
+    "expected_sources": ["app/system_prompt.py", "cli/rag_commands.py", "cli/main.py"]
+  },
+  {
+    "id": "h10-working-memory-store",
+    "question": "Где и в каком формате хранится рабочая память и как она сериализуется на диск?",
+    "expectation": "FileWorkingMemoryRepository хранит рабочую память в ~/.jarvis/working/current.json (задача, контекст, заметки), сериализуя доменную модель WorkingMemory в JSON.",
+    "expected_keywords": ["working", "current.json", "json"],
+    "expected_sources": ["infra/working_memory_repository.py"]
+  }
+]

@@ -16,6 +16,12 @@ dev = [
     "pytest",
     "pytest-cov",
 ]
+# RAG-режим: поиск по FAISS-индексу + эмбеддинги. Тяжёлые и опциональные —
+# основной рантайм остаётся на одном `requests`.
+rag = [
+    "faiss-cpu",
+    "numpy",
+]
 
 [tool.setuptools.packages.find]
 include = ["domain*", "app*", "infra*", "cli*"]

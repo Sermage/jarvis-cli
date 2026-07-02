@@ -306,6 +306,11 @@ def print_help() -> None:
   {CYAN}/know save <имя>{RESET} — сохранить знание
   {CYAN}/know show <имя>{RESET} — показать запись
 
+{BOLD}{BLUE}RAG — поиск по базе документов (/rag):{RESET}
+  {CYAN}/rag{RESET}            — статус RAG-режима (индекс, стратегия, top_k)
+  {CYAN}/rag on{RESET}         — включить: к вопросу подмешивается контекст из базы
+  {CYAN}/rag off{RESET}        — выключить: обычный чат без базы
+
 {BOLD}{MAGENTA}Инварианты (/inv):{RESET}
   {CYAN}/inv list{RESET}        — список нерушимых ограничений проекта
   {CYAN}/inv show <id>{RESET}   — показать инвариант полностью

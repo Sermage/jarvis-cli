@@ -1,6 +1,22 @@
 from app.system_prompt import build_system_prompt
 from domain.invariant import Invariant, InvariantSet, InvariantSeverity
+from domain.retrieval import RetrievedChunk
 from domain.working_memory import WorkingMemory
+
+
+class FakeRetrievalEngine:
+    """Отдаёт заранее заданные чанки; фиксирует, с каким запросом позвали."""
+    def __init__(self, chunks=(), ready=True):
+        self._chunks = list(chunks)
+        self._ready = ready
+        self.last_query = None
+        self.last_top_k = None
+    def is_ready(self) -> bool:
+        return self._ready
+    def retrieve(self, query, top_k=5):
+        self.last_query = query
+        self.last_top_k = top_k
+        return self._chunks
 
 
 class FakeKnowledgeRepo:
@@ -109,3 +125,66 @@ def test_warn_invariant_marked_as_recommended():
     prompt = build_system_prompt(None, WorkingMemory(), FakeKnowledgeRepo(), invs)
     assert "ЖЕЛАТЕЛЬНО" in prompt
     assert "ОБЯЗАТЕЛЬНО" not in prompt
+
+
+# ── RAG ──────────────────────────────────────────────────────────────────────
+
+def test_rag_block_appears_with_chunks_and_sources():
+    eng = FakeRetrievalEngine([
+        RetrievedChunk(text="secondary constructors go after primary",
+                       source="docs/classes.md", section="Constructors"),
+    ])
+    prompt = build_system_prompt(None, WorkingMemory(), FakeKnowledgeRepo(),
+                                 retrieval_engine=eng, user_query="how to declare constructor")
+    assert prompt is not None
+    assert "КОНТЕКСТ ИЗ БАЗЫ ДОКУМЕНТОВ (RAG)" in prompt
+    assert "secondary constructors go after primary" in prompt
+    assert "docs/classes.md" in prompt          # источник для цитаты
+    assert eng.last_query == "how to declare constructor"
+
+
+def test_rag_absent_when_engine_none():
+    prompt = build_system_prompt("проф", WorkingMemory(), FakeKnowledgeRepo(),
+                                 user_query="q")
+    assert "RAG" not in (prompt or "")
+
+
+def test_rag_absent_without_query():
+    eng = FakeRetrievalEngine([RetrievedChunk(text="x")])
+    prompt = build_system_prompt("проф", WorkingMemory(), FakeKnowledgeRepo(),
+                                 retrieval_engine=eng, user_query=None)
+    assert "RAG" not in prompt
+    assert eng.last_query is None               # без запроса поиск не дёргается
+
+
+def test_rag_absent_when_not_ready():
+    eng = FakeRetrievalEngine([RetrievedChunk(text="x")], ready=False)
+    prompt = build_system_prompt("проф", WorkingMemory(), FakeKnowledgeRepo(),
+                                 retrieval_engine=eng, user_query="q")
+    assert "RAG" not in prompt
+
+
+def test_rag_absent_when_no_hits():
+    eng = FakeRetrievalEngine([])
+    prompt = build_system_prompt("проф", WorkingMemory(), FakeKnowledgeRepo(),
+                                 retrieval_engine=eng, user_query="q")
+    assert "RAG" not in prompt
+
+
+def test_rag_passes_top_k_through():
+    eng = FakeRetrievalEngine([RetrievedChunk(text="x")])
+    build_system_prompt(None, WorkingMemory(), FakeKnowledgeRepo(),
+                        retrieval_engine=eng, user_query="q", top_k=3)
+    assert eng.last_top_k == 3
+
+
+def test_rag_block_between_invariants_and_knowledge():
+    invs = FakeInvariantRepo([Invariant(id="x", title="X", rule="r")])
+    eng = FakeRetrievalEngine([RetrievedChunk(text="ctx", source="s.md")])
+    prompt = build_system_prompt("проф", WorkingMemory(task="t"),
+                                 FakeKnowledgeRepo("### a\nд"), invs,
+                                 retrieval_engine=eng, user_query="q")
+    idx_i = prompt.index("ИНВАРИАНТЫ")
+    idx_r = prompt.index("КОНТЕКСТ ИЗ БАЗЫ")
+    idx_k = prompt.index("База знаний")
+    assert idx_i < idx_r < idx_k

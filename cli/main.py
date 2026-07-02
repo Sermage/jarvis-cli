@@ -42,8 +42,11 @@ from cli.config import (
     PROFILES_DIR,
     TASKS_DIR,
     WORKING_DIR,
+    DEFAULT_EMBED_MODEL,
+    DEFAULT_OLLAMA_URL,
     default_model_for,
     load_env,
+    load_rag_config,
     resolve_provider,
 )
 from cli.invariant_commands import handle_inv
@@ -55,6 +58,7 @@ from cli.profile_commands import (
     delete_profile,
     edit_profile,
 )
+from cli.rag_commands import handle_rag
 from cli.settings_commands import (
     choose_model,
     choose_provider,
@@ -89,6 +93,7 @@ from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
 from infra.mcp_registry import StdioMcpRegistry
 from infra.profile_repository import FileProfileRepository
+from infra.rag_retrieval import FaissOllamaRetrievalEngine
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
 from infra.working_memory_repository import FileWorkingMemoryRepository
@@ -149,6 +154,17 @@ def main():
     knowledge_repo = FileKnowledgeRepository(KNOWLEDGE_DIR)
     invariant_repo = FileInvariantRepository(INVARIANTS_DIR)
     mcp_repo       = FileMcpConfigRepository(MCP_CONFIG_FILE)
+
+    # RAG: движок поиска по индексу документов (порт RetrievalEngine).
+    rag_config = load_rag_config()
+    rag_engine = FaissOllamaRetrievalEngine(
+        index_path  = rag_config.index_path,
+        strategy    = rag_config.strategy,
+        embed_model = DEFAULT_EMBED_MODEL,
+        ollama_url  = DEFAULT_OLLAMA_URL,
+    )
+    if rag_config.enabled and not rag_engine.is_ready():
+        rag_config.enabled = False  # индекс/зависимости недоступны — тихо в обычный режим
 
     print(f"\n{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(введите /help для справки){RESET}")
     print(f"{DIM}провайдер: {provider}{RESET}\n")
@@ -233,6 +249,12 @@ def main():
 
     print_settings(params, current_profile)
     print_memory_status(messages, wm, task_repo, current_profile, knowledge_repo)
+    if rag_config.enabled:
+        print(f"{DIM}RAG: включён (индекс {rag_config.index_path}, "
+              f"стратегия {rag_config.strategy}, top_k={rag_config.top_k}). "
+              f"Переключить — /rag off.{RESET}")
+    elif rag_engine.is_ready():
+        print(f"{DIM}RAG: индекс найден, но выключен. Включить — /rag on.{RESET}")
     print()
 
     # Гарантируем остановку MCP-подпроцессов даже при падении или Ctrl+C
@@ -301,6 +323,8 @@ def main():
                 handle_inv(user_input, invariant_repo)
             elif cmd.startswith("/mcp"):
                 handle_mcp(user_input, mcp_repo, mcp_registry)
+            elif cmd.startswith("/rag"):
+                handle_rag(user_input, rag_config, rag_engine)
             elif cmd == "/profile new":
                 current_profile = create_profile(profile_repo, current_profile)
             elif cmd == "/profile edit":
@@ -421,12 +445,16 @@ def main():
         # Краткосрочная память: добавляем сообщение пользователя
         messages.append({"role": "user", "content": user_input})
 
-        # Формируем system prompt из долговременной + рабочей памяти + инвариантов
+        # Формируем system prompt из долговременной + рабочей памяти + инвариантов.
+        # В RAG-режиме сюда же подмешивается найденный по вопросу контекст.
         system_prompt = build_system_prompt(
             current_profile.content if current_profile else None,
             wm,
             knowledge_repo,
             invariant_repo,
+            retrieval_engine=rag_engine if rag_config.enabled else None,
+            user_query=user_input,
+            top_k=rag_config.top_k,
         )
 
         loop = None
