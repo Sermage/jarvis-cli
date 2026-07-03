@@ -101,6 +101,19 @@ def ask(client, params, question: str, system_prompt):
         return f"[ошибка запроса: {e}]"
 
 
+def ask_history(client, params, messages, system_prompt):
+    """Спросить модель, передав ВСЮ историю диалога (а не один вопрос).
+
+    Именно так работает реальный чат jarvis (cli/main.py): краткосрочная память
+    едет списком messages, долговременная/рабочая — в system_prompt. Для проверки
+    «не теряет ли цель» это принципиально — модель должна видеть весь диалог.
+    """
+    try:
+        return client.chat(messages, params, system_prompt)
+    except Exception as e:
+        return f"[ошибка запроса: {e}]"
+
+
 _FULL_CTX_HEADER = (
     "[ИСХОДНЫЙ КОД РЕПОЗИТОРИЯ jarvis]\n"
     "Ниже приведён исходный код проекта (возможно, обрезан по лимиту). "
@@ -319,6 +332,129 @@ def run_check_citations(args, client, params, base_engine, questions, top_k):
     print("=" * 70)
 
 
+def run_conversation(args, client, params, base_engine, scenarios, top_k):
+    """Прогнать длинные диалоги через реальный чат-пайплайн jarvis.
+
+    Для каждого сценария:
+      • рабочая память (task state) заводится из goal + constraints + notes;
+      • история диалога `messages` растёт от хода к ходу и целиком передаётся
+        модели (краткосрочная память), рабочая память + RAG-контекст — в
+        system prompt (`build_system_prompt`, тот же путь, что в cli/main.py);
+      • некоторые ходы дозаписывают в WM уточнения/термины (эмуляция /wm) —
+        проверяем, что они не теряются к финальному probe.
+
+    На каждом ходе детерминированно (app/conversation_check + app/answer_check):
+      • цель (wm.task) инъектирована в промпт → память не вытеснена RAG-ом;
+      • on-topic  → есть источники и цитаты;
+      • off-topic → честное «не знаю» без источников;
+      • probe     → ассистент вспомнил цель/ограничения (доля терминов ≥ порога).
+    """
+    from app.conversation_check import evaluate_turn
+
+    K, F, T = top_k, args.fetch_k, args.min_score
+    rerankers = {"heuristic": HeuristicReranker(), "llm": LLMReranker(client, params)}
+    rewriter = LLMQueryRewriter(client, params)
+    cfg = RetrievalConfig(top_k=K, fetch_k=F, min_score=T,
+                          reranker=args.reranker, rewrite=False)
+    pipe = RetrievalPipeline(base_engine, cfg, rewriter=rewriter, rerankers=rerankers)
+
+    print("Проверка: мини-чат с RAG + источники + память задачи (длинные диалоги)")
+    print(f"Модель: {params['model']} · порог={T} · fetch_k={F} · top_k={K} · "
+          f"реранкер={args.reranker}\n")
+
+    def _trim(t):
+        t = (t or "").strip()
+        if args.answer_chars and len(t) > args.answer_chars:
+            return t[:args.answer_chars].rstrip() + " …"
+        return t
+
+    grand = {"turns": 0, "passed": 0, "goal": 0,
+             "on": 0, "on_src": 0, "off": 0, "off_ok": 0, "probe": 0, "probe_ok": 0}
+
+    for scen in scenarios:
+        wm = WorkingMemory(task=scen["goal"],
+                           context=dict(scen.get("constraints", {})),
+                           notes=list(scen.get("notes", [])))
+        messages: list = []
+        print("=" * 70)
+        print(f"СЦЕНАРИЙ {scen['id']}: {scen['title']}")
+        print(f"  цель: {wm.task}")
+        print(f"  ограничения: {', '.join(f'{k}={v}' for k, v in wm.context.items())}\n")
+
+        s = {"turns": 0, "passed": 0, "goal": 0}
+        for turn in scen["turns"]:
+            # Эмуляция ручного /wm: ход может зафиксировать термин/уточнение.
+            if turn.get("set_ctx"):
+                wm.context.update(turn["set_ctx"])
+            if turn.get("set_note"):
+                wm.notes.append(turn["set_note"])
+
+            u = turn["user"]
+            messages.append({"role": "user", "content": u})
+            sp = build_system_prompt(None, wm, _EmptyKnowledge(),
+                                     retrieval_engine=pipe, user_query=u, top_k=K)
+            chunks = pipe.retrieve(u, top_k=K)
+            answer = ask_history(client, params, messages, sp)
+            messages.append({"role": "assistant", "content": answer})
+
+            v = evaluate_turn(turn, answer, chunks, sp, wm)
+            s["turns"] += 1
+            s["passed"] += int(v.passed)
+            s["goal"] += int(v.goal_injected)
+            grand["turns"] += 1
+            grand["passed"] += int(v.passed)
+            grand["goal"] += int(v.goal_injected)
+
+            mark = "✔" if v.passed else "✗"
+            goal = "цель✔" if v.goal_injected else "цель✗"
+            print(f"── {v.turn_id} [{v.kind}] {goal} ── {u}")
+            if v.kind == "off-topic":
+                grand["off"] += 1
+                grand["off_ok"] += int(v.passed)
+                verdict = "сказал «не знаю»" if v.refused else "НЕ отказался"
+                extra = "  ⚠ привёл источники!" if v.answer_check and v.answer_check.has_sources else ""
+                print(f"   {mark} {verdict}{extra}")
+            elif v.kind == "probe":
+                grand["probe"] += 1
+                grand["probe_ok"] += int(v.passed)
+                print(f"   {mark} вспомнил {v.recall:.0%} терминов цели/ограничений")
+            else:  # on-topic
+                grand["on"] += 1
+                chk = v.answer_check
+                if not v.hit_context:
+                    print(f"   {mark} контекст пуст → "
+                          f"{'«не знаю» (ок)' if v.refused else 'нет отказа (провал)'}")
+                else:
+                    grand["on_src"] += int(bool(chk and chk.has_sources and chk.has_citations))
+                    srcs = ", ".join(sorted({c.source for c in chunks}))
+                    print(f"   {mark} источники={'✔' if chk.has_sources else '✗'}  "
+                          f"цитаты={'✔' if chk.has_citations else '✗'} ({chk.n_citations})  "
+                          f"дословно={chk.n_grounded}/{chk.n_citations}  [{srcs}]")
+                    if chk.fabricated:
+                        print(f"   ⚠ выдумка: {chk.fabricated}")
+            if args.show_answers:
+                print("   " + _trim(answer).replace("\n", "\n   "))
+            print()
+
+        print(f"  ИТОГ {scen['id']}: ходов {s['turns']}, прошло {s['passed']}/{s['turns']} "
+              f"({s['passed']/s['turns']:.0%}), цель в промпте {s['goal']}/{s['turns']} "
+              f"({s['goal']/s['turns']:.0%})\n")
+
+    print("=" * 70)
+    print("СВОДКА ПО ДИАЛОГАМ")
+    g = grand
+    print(f"  всего ходов:              {g['turns']}")
+    print(f"  прошло проверку:          {g['passed']}/{g['turns']} ({g['passed']/g['turns']:.0%})")
+    print(f"  цель не потеряна (в промпте): {g['goal']}/{g['turns']} ({g['goal']/g['turns']:.0%})")
+    if g["on"]:
+        print(f"  on-topic с источниками:   {g['on_src']}/{g['on']} ({g['on_src']/g['on']:.0%})")
+    if g["off"]:
+        print(f"  off-topic → «не знаю»:    {g['off_ok']}/{g['off']} ({g['off_ok']/g['off']:.0%})")
+    if g["probe"]:
+        print(f"  probe → цель вспомнена:   {g['probe_ok']}/{g['probe']} ({g['probe_ok']/g['probe']:.0%})")
+    print("=" * 70)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-judge", action="store_true", help="не звать LLM-судью")
@@ -339,6 +475,10 @@ def main():
                     help="сравнить ступени RAG: baseline → +filter → +rerank → improved")
     ap.add_argument("--check-citations", action="store_true",
                     help="проверить обязательные источники/цитаты + режим «не знаю»")
+    ap.add_argument("--conversation", action="store_true",
+                    help="прогнать длинные диалоги (мини-чат + память задачи + источники)")
+    ap.add_argument("--scenarios", default="scenarios.json",
+                    help="файл со сценариями диалогов (для --conversation)")
     ap.add_argument("--reranker", choices=["heuristic", "llm"], default="heuristic",
                     help="реранкер для режимов +rerank/improved (--compare-modes)")
     ap.add_argument("--fetch-k", type=int, default=20,
@@ -382,6 +522,17 @@ def main():
     # Проверка обязательных источников/цитат + режима «не знаю» (третий этап).
     if args.check_citations:
         run_check_citations(args, client, params, engine, questions, rag_cfg.top_k)
+        return
+
+    # Мини-чат: длинные диалоги с памятью задачи + источниками (четвёртый этап).
+    if args.conversation:
+        spath = args.scenarios if os.path.isabs(args.scenarios) \
+            else os.path.join(os.path.dirname(__file__), args.scenarios)
+        with open(spath, encoding="utf-8") as f:
+            scenarios = json.load(f)
+        if args.limit:
+            scenarios = scenarios[:args.limit]
+        run_conversation(args, client, params, engine, scenarios, rag_cfg.top_k)
         return
 
     # Базовый режim: пустой промпт или весь репозиторий (full-context).
