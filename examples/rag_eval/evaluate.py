@@ -26,6 +26,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from app.answer_check import check_answer, is_dont_know
 from app.retrieval_pipeline import RetrievalPipeline
 from app.system_prompt import build_system_prompt, format_rag_block
 from cli.config import (
@@ -232,6 +233,92 @@ def run_compare_modes(args, client, params, base_engine, questions, top_k):
     print("=" * 70)
 
 
+def run_check_citations(args, client, params, base_engine, questions, top_k):
+    """Проверить обязательные источники/цитаты + режим «не знаю» на N вопросах.
+
+    Для каждого вопроса строится реальный prompt пути jarvis (с порогом min_score
+    и обязательным форматом ответа), модель отвечает, и ответ проверяется
+    ДЕТЕРМИНИРОВАННО (app/answer_check.py):
+      • on-topic (найдены чанки) — есть источники, есть цитаты, каждая цитата
+        дословно встречается в найденных чанках (grounded — ловит галлюцинации);
+      • no-context (порог отсёк всё) — ассистент обязан сказать «не знаю» и не
+        выдумывать источники.
+    Вопрос с пустым expected_sources считается заведомо off-topic (ждём «не знаю»).
+    """
+    K, F, T = top_k, args.fetch_k, args.min_score
+    rerankers = {"heuristic": HeuristicReranker(), "llm": LLMReranker(client, params)}
+    rewriter = LLMQueryRewriter(client, params)
+    cfg = RetrievalConfig(top_k=K, fetch_k=F, min_score=T,
+                          reranker=args.reranker, rewrite=False)
+    pipe = RetrievalPipeline(base_engine, cfg, rewriter=rewriter, rerankers=rerankers)
+
+    print("Проверка: обязательные источники + цитаты + режим «не знаю»")
+    print(f"Модель: {params['model']} · порог={T} · fetch_k={F} · top_k={K} · "
+          f"реранкер={args.reranker}\n")
+
+    def _trim(t):
+        t = (t or "").strip()
+        if args.answer_chars and len(t) > args.answer_chars:
+            return t[:args.answer_chars].rstrip() + " …"
+        return t
+
+    on = {"n": 0, "src": 0, "cit": 0, "grounded": 0, "no_fab": 0}
+    noctx = {"n": 0, "refused": 0}
+    for q in questions:
+        qtext = q["question"]
+        intended_offtopic = not q.get("expected_sources", [])
+        chunks = pipe.retrieve(qtext, top_k=K)
+        sp = build_system_prompt(None, WorkingMemory(), _EmptyKnowledge(),
+                                 retrieval_engine=pipe, user_query=qtext, top_k=K)
+        answer = ask(client, params, qtext, sp)
+
+        tag = "off-topic" if intended_offtopic else "on-topic "
+        print(f"── {q['id']} ── [{tag}]  {qtext}")
+
+        if not chunks:
+            # Слабый контекст → обязателен отказ «не знаю».
+            refused = is_dont_know(answer)
+            chk = check_answer(answer, chunks)
+            noctx["n"] += 1
+            noctx["refused"] += int(refused and not chk.has_sources)
+            verdict = "✔ сказал «не знаю»" if refused else "✗ НЕ отказался"
+            extra = "  ⚠ привёл источники!" if chk.has_sources else ""
+            print(f"   контекст пуст (порог {T}) → {verdict}{extra}")
+        else:
+            chk = check_answer(answer, chunks)
+            on["n"] += 1
+            on["src"] += int(chk.has_sources)
+            on["cit"] += int(chk.has_citations)
+            on["grounded"] += int(chk.citations_grounded)
+            on["no_fab"] += int(chk.no_fabrication)
+            srcs = ", ".join(sorted({c.source for c in chunks}))
+            print(f"   источники={'✔' if chk.has_sources else '✗'}  "
+                  f"цитаты={'✔' if chk.has_citations else '✗'} ({chk.n_citations})  "
+                  f"дословно={chk.n_grounded}/{chk.n_citations}  "
+                  f"из контекста={chk.n_from_context}/{chk.n_citations}  [{srcs}]")
+            if chk.fabricated:
+                print(f"   ⚠ выдумка (нет в контексте): {chk.fabricated}")
+            elif chk.ungrounded:
+                print(f"   ~ реконструкции (смысл из контекста, не дословно): {chk.ungrounded}")
+        if args.show_answers:
+            print("   " + _trim(answer).replace("\n", "\n   "))
+        print()
+
+    print("=" * 70)
+    print("СВОДКА ПРОВЕРКИ ЦИТИРОВАНИЯ")
+    if on["n"]:
+        print(f"  on-topic вопросов: {on['n']}")
+        print(f"    с источниками:            {on['src']}/{on['n']} ({on['src']/on['n']:.0%})")
+        print(f"    с цитатами:               {on['cit']}/{on['n']} ({on['cit']/on['n']:.0%})")
+        print(f"    цитаты дословны:          {on['grounded']}/{on['n']} ({on['grounded']/on['n']:.0%})")
+        print(f"    без выдумок (из контекста): {on['no_fab']}/{on['n']} ({on['no_fab']/on['n']:.0%})")
+    if noctx["n"]:
+        print(f"  no-context вопросов: {noctx['n']}")
+        print(f"    корректный отказ «не знаю»: {noctx['refused']}/{noctx['n']} "
+              f"({noctx['refused']/noctx['n']:.0%})")
+    print("=" * 70)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-judge", action="store_true", help="не звать LLM-судью")
@@ -250,6 +337,8 @@ def main():
                     help="лимит символов full-context промпта (грубо ~64K токенов)")
     ap.add_argument("--compare-modes", action="store_true",
                     help="сравнить ступени RAG: baseline → +filter → +rerank → improved")
+    ap.add_argument("--check-citations", action="store_true",
+                    help="проверить обязательные источники/цитаты + режим «не знаю»")
     ap.add_argument("--reranker", choices=["heuristic", "llm"], default="heuristic",
                     help="реранкер для режимов +rerank/improved (--compare-modes)")
     ap.add_argument("--fetch-k", type=int, default=20,
@@ -288,6 +377,11 @@ def main():
     # Режим сравнения ступеней улучшенного RAG (второй этап задания).
     if args.compare_modes:
         run_compare_modes(args, client, params, engine, questions, rag_cfg.top_k)
+        return
+
+    # Проверка обязательных источников/цитат + режима «не знаю» (третий этап).
+    if args.check_citations:
+        run_check_citations(args, client, params, engine, questions, rag_cfg.top_k)
         return
 
     # Базовый режim: пустой промпт или весь репозиторий (full-context).
