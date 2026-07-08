@@ -285,8 +285,9 @@ def _short_repr(value, limit: int) -> str:
 def print_help() -> None:
     print(f"""
 {BOLD}Чат:{RESET}
-  {CYAN}/provider{RESET}       — переключить LLM-провайдера (deepseek / gigachat)
-  {CYAN}/model{RESET}          — выбрать модель
+  {CYAN}/local{RESET}           — быстро переключиться на локальную модель (Ollama)
+  {CYAN}/provider{RESET}       — переключить LLM-провайдера (deepseek / gigachat / ollama)
+  {CYAN}/model{RESET}          — выбрать модель (для ollama — список установленных)
   {CYAN}/temp{RESET}           — задать temperature
   {CYAN}/tokens{RESET}         — задать max_tokens
   {CYAN}/settings{RESET}       — текущие настройки

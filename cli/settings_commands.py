@@ -1,11 +1,36 @@
 """CLI-обработчики /model, /temp, /tokens, /provider."""
 from __future__ import annotations
 
-from cli.ansi import BOLD, DIM, GREEN, RESET
-from cli.config import PROVIDERS, models_for
+from typing import Any, Optional
+
+from cli.ansi import BOLD, DIM, GREEN, RESET, YELLOW
+from cli.config import OLLAMA, PROVIDERS, models_for
 
 
-def choose_model(params: dict, provider: str) -> None:
+def choose_model(params: dict, provider: str, llm_client: Optional[Any] = None) -> None:
+    """Показать список моделей и обновить params["model"].
+
+    Для провайдера ollama список тянется динамически из запущенного сервера
+    (через llm_client.list_models()), что позволяет видеть только реально
+    установленные модели. Для остальных провайдеров — статический список из конфига.
+    """
+    if provider == OLLAMA and llm_client is not None and hasattr(llm_client, "list_models"):
+        installed = llm_client.list_models()
+        if not installed:
+            print(f"{YELLOW}Ollama не отвечает или нет установленных моделей.{RESET}")
+            print(f"{DIM}Установить модель: ollama pull <имя>{RESET}")
+            return
+        print(f"\n{BOLD}Установленные модели Ollama:{RESET}")
+        indexed = {str(i): name for i, name in enumerate(installed, 1)}
+        for k, name in indexed.items():
+            marker = " ◀" if name == params["model"] else ""
+            print(f"  {k}. {name}{marker}")
+        choice = input("Номер (Enter — оставить текущую): ").strip()
+        if choice in indexed:
+            params["model"] = indexed[choice]
+            print(f"{GREEN}Модель: {params['model']}{RESET}")
+        return
+
     models = models_for(provider)
     print(f"\n{BOLD}Выберите модель ({provider}):{RESET}")
     for k, (mid, label) in models.items():

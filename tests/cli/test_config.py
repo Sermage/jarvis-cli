@@ -82,8 +82,9 @@ def test_load_env_strips_whitespace_around_kv(tmp_path, isolated_env):
     assert os.environ["KEY"] == "spaced"
 
 
-def test_providers_listing_includes_deepseek_and_gigachat():
-    assert set(PROVIDERS) == {DEEPSEEK, GIGACHAT}
+def test_providers_listing_includes_all_providers():
+    from cli.config import OLLAMA
+    assert set(PROVIDERS) == {DEEPSEEK, GIGACHAT, OLLAMA}
     assert DEFAULT_PROVIDER == DEEPSEEK
 
 
