@@ -26,7 +26,8 @@ def load_env(env_path: str) -> None:
 
 DEEPSEEK   = "deepseek"
 GIGACHAT   = "gigachat"
-PROVIDERS  = (DEEPSEEK, GIGACHAT)
+OLLAMA     = "ollama"
+PROVIDERS  = (DEEPSEEK, GIGACHAT, OLLAMA)
 DEFAULT_PROVIDER = DEEPSEEK
 
 # ── DeepSeek ────────────────────────────────────────────────────────────────
@@ -53,16 +54,30 @@ GIGACHAT_MODELS = {
     "6": ("GigaChat-2-Max", "GigaChat-2-Max (сильная, v2)"),
 }
 
+# ── Ollama ──────────────────────────────────────────────────────────────────
+
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+OLLAMA_MODELS = {
+    "1": ("qwen2.5:14b",  "Qwen 2.5 14B (локально)"),
+    "2": ("qwen2.5:7b",   "Qwen 2.5 7B (локально)"),
+    "3": ("llama3.1:8b",  "Llama 3.1 8B (локально)"),
+    "4": ("gemma3:12b",   "Gemma 3 12B (локально)"),
+    "5": ("phi4:14b",     "Phi-4 14B (локально)"),
+}
+
 # ── провайдер → модели / дефолт ─────────────────────────────────────────────
 
 MODELS_BY_PROVIDER = {
     DEEPSEEK: DEEPSEEK_MODELS,
     GIGACHAT: GIGACHAT_MODELS,
+    OLLAMA:   OLLAMA_MODELS,
 }
 
 DEFAULT_MODEL_BY_PROVIDER = {
     DEEPSEEK: "deepseek-chat",
     GIGACHAT: "GigaChat",
+    OLLAMA:   "qwen2.5:14b",
 }
 
 
@@ -77,6 +92,9 @@ def default_model_for(provider: str) -> str:
 def resolve_provider(env_value: str) -> str:
     """Нормализовать значение LLM_PROVIDER, упасть на default при пустом/неизвестном."""
     v = (env_value or "").strip().lower()
+    # «local» — удобный псевдоним для ollama
+    if v == "local":
+        return OLLAMA
     return v if v in PROVIDERS else DEFAULT_PROVIDER
 
 

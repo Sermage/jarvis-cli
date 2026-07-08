@@ -39,6 +39,8 @@ from cli.config import (
     KNOWLEDGE_DIR,
     MAX_SESSIONS,
     MCP_CONFIG_FILE,
+    OLLAMA,
+    OLLAMA_BASE_URL,
     PROFILES_DIR,
     TASKS_DIR,
     WORKING_DIR,
@@ -89,6 +91,7 @@ from app.retrieval_pipeline import RetrievalPipeline
 from domain.profile import Profile
 from infra.deepseek_client import DeepSeekClient
 from infra.gigachat_client import RequestsGigaChatClient
+from infra.ollama_client import OllamaClient
 from infra.invariant_repository import FileInvariantRepository
 from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
@@ -133,6 +136,10 @@ def _build_client(provider: str) -> LLMClient:
             chat_url  = GIGACHAT_CHAT_URL,
             scope     = GIGACHAT_SCOPE,
         )
+
+    if provider == OLLAMA:
+        base_url = os.environ.get("OLLAMA_BASE_URL", "").strip() or OLLAMA_BASE_URL
+        return OllamaClient(base_url=base_url)
 
     raise RuntimeError(f"Неизвестный провайдер: {provider}")
 
@@ -307,7 +314,7 @@ def main():
                 print(f"{DIM}Выход.{RESET}")
                 break
             elif cmd == "/model":
-                choose_model(params, provider)
+                choose_model(params, provider, llm_client=client)
             elif cmd == "/provider":
                 new_provider = choose_provider(provider)
                 if new_provider != provider:
@@ -323,6 +330,25 @@ def main():
                     elif mcp_registry.all_tools():
                         print(f"{YELLOW}Tool calling доступен только для DeepSeek — "
                               f"MCP-тулы временно отключены.{RESET}")
+            elif cmd == "/local":
+                if provider == OLLAMA:
+                    print(f"{DIM}Уже на локальной модели (ollama).{RESET}")
+                    choose_model(params, provider, llm_client=client)
+                else:
+                    provider = OLLAMA
+                    client = _build_client(provider)
+                    tool_router = None
+                    installed = client.list_models() if hasattr(client, "list_models") else []
+                    if installed:
+                        params["model"] = installed[0]
+                        print(f"{GREEN}Переключено на локальную модель: {params['model']}{RESET}")
+                        if len(installed) > 1:
+                            print(f"{DIM}Другие модели: {', '.join(installed[1:])}. "
+                                  f"Сменить — /model{RESET}")
+                    else:
+                        params["model"] = default_model_for(OLLAMA)
+                        print(f"{YELLOW}Ollama не отвечает или нет установленных моделей.{RESET}")
+                        print(f"{DIM}Установить: ollama pull qwen2.5:14b{RESET}")
             elif cmd == "/temp":
                 set_temperature(params)
             elif cmd == "/tokens":
