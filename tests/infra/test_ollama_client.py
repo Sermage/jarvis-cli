@@ -74,11 +74,12 @@ def test_chat_omits_none_params():
     fake = _FakePost([_ok()])
     _client(fake).chat(
         [{"role": "user", "content": "x"}],
-        {"model": "m", "temperature": None, "max_tokens": None},
+        {"model": "m", "temperature": None, "max_tokens": None, "num_ctx": None},
     )
     body = fake.calls[0]["json"]
     assert "temperature" not in body
     assert "max_tokens" not in body
+    assert "options" not in body
 
 
 def test_chat_forwards_temperature_and_max_tokens():
@@ -90,6 +91,26 @@ def test_chat_forwards_temperature_and_max_tokens():
     body = fake.calls[0]["json"]
     assert body["temperature"] == 0.7
     assert body["max_tokens"] == 256
+
+
+def test_chat_forwards_num_ctx_via_options():
+    fake = _FakePost([_ok()])
+    _client(fake).chat(
+        [{"role": "user", "content": "x"}],
+        {"model": "m", "num_ctx": 8192},
+    )
+    body = fake.calls[0]["json"]
+    assert body["options"] == {"num_ctx": 8192}
+
+
+def test_chat_omits_options_when_num_ctx_is_none():
+    fake = _FakePost([_ok()])
+    _client(fake).chat(
+        [{"role": "user", "content": "x"}],
+        {"model": "m", "num_ctx": None},
+    )
+    body = fake.calls[0]["json"]
+    assert "options" not in body
 
 
 def test_chat_propagates_http_error():

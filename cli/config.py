@@ -102,6 +102,7 @@ DEFAULT_PARAMS = {
     "model":       DEFAULT_MODEL_BY_PROVIDER[DEFAULT_PROVIDER],
     "temperature": None,
     "max_tokens":  None,
+    "num_ctx":     None,
 }
 
 # ── пути под ~/.jarvis/ ─────────────────────────────────────────────────────

@@ -72,3 +72,16 @@ def set_max_tokens(params: dict) -> None:
         params["max_tokens"] = None
     else:
         params["max_tokens"] = int(val)
+
+
+def set_context_window(params: dict) -> None:
+    """Установить размер контекстного окна (только для Ollama).
+
+    Ollama по умолчанию использует 2048 токенов. Qwen 2.5 14b поддерживает
+    до 32768. Рекомендуется 8192 для обычного диалога, 32768 для длинных задач.
+    """
+    val = input("num_ctx (2048 / 8192 / 32768, Enter — auto/default): ").strip()
+    if val == "":
+        params["num_ctx"] = None
+    else:
+        params["num_ctx"] = int(val)
