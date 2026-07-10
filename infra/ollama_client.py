@@ -70,4 +70,8 @@ class OllamaClient:
             body["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             body["max_tokens"] = params["max_tokens"]
+        # num_ctx расширяет контекстное окно выше дефолтных 2048 Ollama.
+        # Передаётся в Ollama-специфичный блок options (не часть OpenAI-spec).
+        if params.get("num_ctx") is not None:
+            body["options"] = {"num_ctx": params["num_ctx"]}
         return body

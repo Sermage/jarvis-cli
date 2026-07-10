@@ -64,6 +64,7 @@ from cli.rag_commands import handle_rag
 from cli.settings_commands import (
     choose_model,
     choose_provider,
+    set_context_window,
     set_max_tokens,
     set_temperature,
 )
@@ -353,6 +354,8 @@ def main():
                 set_temperature(params)
             elif cmd == "/tokens":
                 set_max_tokens(params)
+            elif cmd == "/ctx":
+                set_context_window(params)
             elif cmd == "/settings":
                 print_settings(params, current_profile)
                 print_memory_status(messages, wm, task_repo, current_profile, knowledge_repo)

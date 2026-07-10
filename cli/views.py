@@ -168,8 +168,10 @@ def task_status_badge(task_repo: TaskRepository) -> str:
 def print_settings(params: dict, current_profile: Optional[Profile]) -> None:
     temp  = params["temperature"] if params["temperature"] is not None else "auto"
     maxt  = params["max_tokens"]  if params["max_tokens"]  is not None else "auto"
+    ctx   = params.get("num_ctx")
     pname = current_profile.name if current_profile else "нет"
-    print(f"{DIM}  модель: {params['model']}  temperature: {temp}  max_tokens: {maxt}  профиль: {pname}{RESET}")
+    ctx_part = f"  num_ctx: {ctx}" if ctx is not None else ""
+    print(f"{DIM}  модель: {params['model']}  temperature: {temp}  max_tokens: {maxt}{ctx_part}  профиль: {pname}{RESET}")
 
 
 def print_memory_status(messages: list,
@@ -290,6 +292,7 @@ def print_help() -> None:
   {CYAN}/model{RESET}          — выбрать модель (для ollama — список установленных)
   {CYAN}/temp{RESET}           — задать temperature
   {CYAN}/tokens{RESET}         — задать max_tokens
+  {CYAN}/ctx{RESET}            — задать num_ctx (контекстное окно, только Ollama; Qwen: до 32768)
   {CYAN}/settings{RESET}       — текущие настройки
   {CYAN}/clear{RESET}          — очистить краткосрочную память (диалог)
   {CYAN}/quit{RESET} / Ctrl+D  — выход
