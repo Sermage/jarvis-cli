@@ -147,6 +147,19 @@ class McpRegistry(Protocol):
     def shutdown(self) -> None: ...
 
 
+class GitContextProvider(Protocol):
+    """Источник сведений о git-состоянии проекта.
+
+    Абстрагирует способ получения данных: конкретная реализация в infra/
+    ходит за ними в MCP-сервер (`mcp-server-git`). Use case `/help` знает
+    только про этот порт, поэтому в тестах подменяется фейком.
+    """
+
+    def current_branch(self) -> Optional[str]:
+        """Текущая ветка репозитория или None, если определить не удалось."""
+        ...
+
+
 class McpConfigRepository(Protocol):
     """Хранилище конфигурации MCP-серверов (~/.jarvis/mcp/servers.json)."""
 

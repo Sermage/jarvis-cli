@@ -51,6 +51,7 @@ from cli.config import (
     load_rag_config,
     resolve_provider,
 )
+from cli.help_commands import handle_help
 from cli.invariant_commands import handle_inv
 from cli.know_commands import handle_know
 from cli.mcp_commands import handle_mcp
@@ -79,7 +80,6 @@ from cli.tool_progress import ToolProgressReporter
 from cli.views import (
     announce_guard_result,
     announce_task_transitions,
-    print_help,
     print_mem_detail,
     print_memory_status,
     print_settings,
@@ -96,6 +96,7 @@ from infra.ollama_client import OllamaClient
 from infra.invariant_repository import FileInvariantRepository
 from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
+from infra.mcp_git import McpGitContextProvider
 from infra.mcp_registry import StdioMcpRegistry
 from infra.profile_repository import FileProfileRepository
 from infra.query_rewriter import LLMQueryRewriter
@@ -213,6 +214,14 @@ def main():
                   f"обнаружено {tools_count} тулов.{RESET}")
         for sid, err in mcp_registry.failures():
             print(f"{YELLOW}MCP[{sid}] не стартовал: {err}{RESET}")
+
+    # Git-контекст для /help берётся через MCP-сервер git. Путь репозитория —
+    # корень jarvis-cli (переопределяется JARVIS_REPO_PATH).
+    repo_path = os.path.expanduser(
+        os.environ.get("JARVIS_REPO_PATH", "").strip()
+        or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    git_provider = McpGitContextProvider(mcp_registry, repo_path)
 
     tool_router = ToolRouter(client, mcp_registry) \
         if provider == DEEPSEEK and mcp_registry.all_tools() else None
@@ -394,8 +403,9 @@ def main():
                 print(f"{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(новая сессия, /help — справка){RESET}")
                 print(f"{DIM}провайдер: {provider}{RESET}\n")
                 print(f"{DIM}Краткосрочная память очищена. Старая сессия сохранена в истории.{RESET}")
-            elif cmd == "/help":
-                print_help()
+            elif cmd == "/help" or cmd.startswith("/help "):
+                handle_help(user_input, rag_engine, git_provider, client,
+                            params, top_k=rag_config.top_k)
             else:
                 print(f"{YELLOW}Неизвестная команда. Введите /help.{RESET}")
             continue
