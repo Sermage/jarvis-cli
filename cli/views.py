@@ -360,6 +360,7 @@ def print_help() -> None:
 {BOLD}Обзор:{RESET}
   {CYAN}/mem{RESET}             — показать все слои памяти
   {CYAN}/help{RESET}            — эта справка
+  {CYAN}/help <вопрос>{RESET}   — ответ о проекте по документации (RAG) + git-ветка через MCP
 
 {DIM}Что куда сохраняется:
   краткосрочная → текущий диалог (messages), авто
