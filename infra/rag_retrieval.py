@@ -100,3 +100,28 @@ class FaissOllamaRetrievalEngine:
                 chunk_id=m.get("chunk_id", ""),
             ))
         return hits
+
+
+class CompositeRetrievalEngine:
+    """Объединяет несколько движков в один порт `RetrievalEngine`.
+
+    Нужен AI-ревью: контекст берётся сразу из двух индексов — документации и
+    кода. Каждый под-движок опрашивается по одному запросу, результаты
+    сливаются и переупорядочиваются по косинусной близости, наверх выходит
+    top_k. Не готовые под-движки (нет индекса/зависимостей) молча пропускаются,
+    поэтому один отсутствующий индекс не ломает ревью.
+    """
+
+    def __init__(self, engines: list):
+        self._engines = list(engines)
+
+    def is_ready(self) -> bool:
+        return any(e.is_ready() for e in self._engines)
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[RetrievedChunk]:
+        merged: list[RetrievedChunk] = []
+        for engine in self._engines:
+            if engine.is_ready():
+                merged.extend(engine.retrieve(query, top_k=top_k))
+        merged.sort(key=lambda c: c.score, reverse=True)
+        return merged[:top_k]

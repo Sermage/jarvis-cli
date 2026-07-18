@@ -46,11 +46,14 @@ from cli.config import (
     WORKING_DIR,
     DEFAULT_EMBED_MODEL,
     DEFAULT_OLLAMA_URL,
+    code_index_path,
     default_model_for,
     load_env,
     load_rag_config,
     resolve_provider,
 )
+from cli.help_commands import handle_help
+from cli.review_commands import handle_review
 from cli.invariant_commands import handle_inv
 from cli.know_commands import handle_know
 from cli.mcp_commands import handle_mcp
@@ -79,7 +82,6 @@ from cli.tool_progress import ToolProgressReporter
 from cli.views import (
     announce_guard_result,
     announce_task_transitions,
-    print_help,
     print_mem_detail,
     print_memory_status,
     print_settings,
@@ -96,10 +98,12 @@ from infra.ollama_client import OllamaClient
 from infra.invariant_repository import FileInvariantRepository
 from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
+from infra.mcp_git import McpGitContextProvider
 from infra.mcp_registry import StdioMcpRegistry
+from infra.pr_diff import GhDiffProvider
 from infra.profile_repository import FileProfileRepository
 from infra.query_rewriter import LLMQueryRewriter
-from infra.rag_retrieval import FaissOllamaRetrievalEngine
+from infra.rag_retrieval import CompositeRetrievalEngine, FaissOllamaRetrievalEngine
 from infra.rerankers import HeuristicReranker, LLMReranker
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
@@ -198,6 +202,18 @@ def main():
     if rag_config.enabled and not rag_engine.is_ready():
         rag_config.enabled = False  # индекс/зависимости недоступны — тихо в обычный режим
 
+    # AI-ревью PR (/review): RAG по двум индексам сразу — документация + код.
+    # Берём базовые движки (без rewrite/rerank): для разбора diff достаточно
+    # прямого косинусного поиска, объединённого композитом.
+    code_base_engine = FaissOllamaRetrievalEngine(
+        index_path  = code_index_path(),
+        strategy    = rag_config.strategy,
+        embed_model = DEFAULT_EMBED_MODEL,
+        ollama_url  = DEFAULT_OLLAMA_URL,
+    )
+    review_engine = CompositeRetrievalEngine([rag_base_engine, code_base_engine])
+    diff_provider = GhDiffProvider()
+
     orchestrator = build_default_orchestrator(task_repo)
 
     # MCP: поднимаем все включённые серверы. Если ни одного — registry просто
@@ -213,6 +229,14 @@ def main():
                   f"обнаружено {tools_count} тулов.{RESET}")
         for sid, err in mcp_registry.failures():
             print(f"{YELLOW}MCP[{sid}] не стартовал: {err}{RESET}")
+
+    # Git-контекст для /help берётся через MCP-сервер git. Путь репозитория —
+    # корень jarvis-cli (переопределяется JARVIS_REPO_PATH).
+    repo_path = os.path.expanduser(
+        os.environ.get("JARVIS_REPO_PATH", "").strip()
+        or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    git_provider = McpGitContextProvider(mcp_registry, repo_path)
 
     tool_router = ToolRouter(client, mcp_registry) \
         if provider == DEEPSEEK and mcp_registry.all_tools() else None
@@ -394,8 +418,12 @@ def main():
                 print(f"{BOLD}{GREEN}Jarvis CLI{RESET}  {DIM}(новая сессия, /help — справка){RESET}")
                 print(f"{DIM}провайдер: {provider}{RESET}\n")
                 print(f"{DIM}Краткосрочная память очищена. Старая сессия сохранена в истории.{RESET}")
-            elif cmd == "/help":
-                print_help()
+            elif cmd == "/help" or cmd.startswith("/help "):
+                handle_help(user_input, rag_engine, git_provider, client,
+                            params, top_k=rag_config.top_k)
+            elif cmd == "/review" or cmd.startswith("/review "):
+                handle_review(user_input, review_engine, diff_provider, client,
+                              params, top_k=rag_config.top_k)
             else:
                 print(f"{YELLOW}Неизвестная команда. Введите /help.{RESET}")
             continue

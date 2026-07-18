@@ -13,6 +13,7 @@ from domain.knowledge import KnowledgeEntry
 from domain.mcp import McpServerConfig, McpTool, ToolResult
 from domain.profile import Profile
 from domain.retrieval import RetrievedChunk
+from domain.review import PrDiff
 from domain.task import Task
 from domain.working_memory import WorkingMemory
 
@@ -145,6 +146,44 @@ class McpRegistry(Protocol):
     def get(self, server_id: str) -> Optional[McpClient]: ...
     def all_tools(self) -> list[McpTool]: ...
     def shutdown(self) -> None: ...
+
+
+class GitContextProvider(Protocol):
+    """Источник сведений о git-состоянии проекта.
+
+    Абстрагирует способ получения данных: конкретная реализация в infra/
+    ходит за ними в MCP-сервер (`mcp-server-git`). Use case `/help` знает
+    только про этот порт, поэтому в тестах подменяется фейком.
+    """
+
+    def current_branch(self) -> Optional[str]:
+        """Текущая ветка репозитория или None, если определить не удалось."""
+        ...
+
+
+class DiffProvider(Protocol):
+    """Источник изменений пул-реквеста для AI-ревью.
+
+    Абстрагирует, откуда берётся diff: конкретная реализация в infra/
+    ходит за ним в GitHub через `gh`. Use case `review_pull_request`
+    знает только про этот порт, поэтому в тестах подменяется фейком.
+    """
+
+    def fetch(self, pr: str) -> PrDiff:
+        """Получить diff и список изменённых файлов пул-реквеста `pr`."""
+        ...
+
+
+class ReviewPublisher(Protocol):
+    """Публикация текста ревью обратно в пул-реквест.
+
+    Реализация в infra/ постит комментарий через `gh pr comment`.
+    Пайплайн (composition root) выбирает, публиковать или только печатать.
+    """
+
+    def publish(self, pr: str, body: str) -> None:
+        """Опубликовать ревью `body` комментарием к пул-реквесту `pr`."""
+        ...
 
 
 class McpConfigRepository(Protocol):
