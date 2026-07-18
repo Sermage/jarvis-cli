@@ -121,6 +121,8 @@ MAX_SESSIONS     = 20
 # ── RAG ─────────────────────────────────────────────────────────────────────
 
 DEFAULT_RAG_INDEX_PATH = os.path.expanduser("~/rag-kotlin/index")
+# Индекс по коду проекта — второй источник RAG для AI-ревью PR (доки + код).
+DEFAULT_CODE_INDEX_PATH = os.path.expanduser("~/rag-kotlin/index_jarvis_full")
 DEFAULT_RAG_STRATEGY   = "structural"
 DEFAULT_RAG_TOP_K      = 5
 DEFAULT_RAG_FETCH_K    = 20
@@ -147,6 +149,13 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "да")
+
+
+def code_index_path() -> str:
+    """Путь к индексу по коду проекта (для AI-ревью PR). .env → дефолт."""
+    return os.path.expanduser(
+        os.environ.get("CODE_INDEX_PATH", "").strip() or DEFAULT_CODE_INDEX_PATH
+    )
 
 
 def load_rag_config() -> RetrievalConfig:

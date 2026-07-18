@@ -46,12 +46,14 @@ from cli.config import (
     WORKING_DIR,
     DEFAULT_EMBED_MODEL,
     DEFAULT_OLLAMA_URL,
+    code_index_path,
     default_model_for,
     load_env,
     load_rag_config,
     resolve_provider,
 )
 from cli.help_commands import handle_help
+from cli.review_commands import handle_review
 from cli.invariant_commands import handle_inv
 from cli.know_commands import handle_know
 from cli.mcp_commands import handle_mcp
@@ -98,9 +100,10 @@ from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
 from infra.mcp_git import McpGitContextProvider
 from infra.mcp_registry import StdioMcpRegistry
+from infra.pr_diff import GhDiffProvider
 from infra.profile_repository import FileProfileRepository
 from infra.query_rewriter import LLMQueryRewriter
-from infra.rag_retrieval import FaissOllamaRetrievalEngine
+from infra.rag_retrieval import CompositeRetrievalEngine, FaissOllamaRetrievalEngine
 from infra.rerankers import HeuristicReranker, LLMReranker
 from infra.session_repository import FileSessionRepository
 from infra.task_repository import FileTaskRepository
@@ -198,6 +201,18 @@ def main():
     )
     if rag_config.enabled and not rag_engine.is_ready():
         rag_config.enabled = False  # индекс/зависимости недоступны — тихо в обычный режим
+
+    # AI-ревью PR (/review): RAG по двум индексам сразу — документация + код.
+    # Берём базовые движки (без rewrite/rerank): для разбора diff достаточно
+    # прямого косинусного поиска, объединённого композитом.
+    code_base_engine = FaissOllamaRetrievalEngine(
+        index_path  = code_index_path(),
+        strategy    = rag_config.strategy,
+        embed_model = DEFAULT_EMBED_MODEL,
+        ollama_url  = DEFAULT_OLLAMA_URL,
+    )
+    review_engine = CompositeRetrievalEngine([rag_base_engine, code_base_engine])
+    diff_provider = GhDiffProvider()
 
     orchestrator = build_default_orchestrator(task_repo)
 
@@ -406,6 +421,9 @@ def main():
             elif cmd == "/help" or cmd.startswith("/help "):
                 handle_help(user_input, rag_engine, git_provider, client,
                             params, top_k=rag_config.top_k)
+            elif cmd == "/review" or cmd.startswith("/review "):
+                handle_review(user_input, review_engine, diff_provider, client,
+                              params, top_k=rag_config.top_k)
             else:
                 print(f"{YELLOW}Неизвестная команда. Введите /help.{RESET}")
             continue

@@ -1,0 +1,48 @@
+name: AI Review
+
+# Автоматическое AI-ревью каждого PR: пайплайн достаёт diff, гоняет RAG
+# (документация + код) + LLM и постит разбор комментарием в пул-реквест.
+#
+# Запускается на self-hosted раннере (машина с Ollama для эмбеддингов bge-m3 и
+# готовыми FAISS-индексами в ~/rag-kotlin и ~/.jarvis). Ключ DeepSeek — из
+# secrets репозитория, gh авторизуется через GH_TOKEN.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # Новый пуш в PR отменяет ещё не законченное ревью прошлого коммита.
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup venv + deps
+        run: |
+          python3 -m venv .venv
+          ./.venv/bin/pip install --quiet --upgrade pip
+          ./.venv/bin/pip install --quiet -e ".[rag]"
+
+      - name: AI review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLM_PROVIDER: deepseek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Пути к готовым индексам на self-hosted машине (переопредели при желании).
+          RAG_INDEX_PATH: ~/.jarvis/rag/docs_index
+          CODE_INDEX_PATH: ~/rag-kotlin/index_jarvis_full
+          RAG_STRATEGY: structural
+        run: |
+          ./.venv/bin/python review_pr.py "${{ github.event.pull_request.number }}"
