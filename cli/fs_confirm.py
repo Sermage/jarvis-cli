@@ -11,6 +11,7 @@ callable — инфраструктурный клиент про термина
 """
 from __future__ import annotations
 
+import sys
 from typing import Callable
 
 from cli.ansi import BOLD, CYAN, DIM, GREEN, RED, RESET
@@ -40,7 +41,6 @@ def make_interactive_confirm(reader: Callable[[str], str] = input,
     `reader` — как читать ответ пользователя (по умолчанию `input`); в тестах
     подменяется. Возвращает `True`, только если пользователь явно согласился.
     """
-    import sys
     out = stream or sys.stdout
 
     def confirm(rel: str, diff: str) -> bool:
