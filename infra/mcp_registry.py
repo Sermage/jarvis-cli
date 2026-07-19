@@ -74,6 +74,18 @@ class StdioMcpRegistry:
             self._clients[cfg.server_id] = client
         self._tools_cache = None
 
+    def register(self, client: McpClient) -> None:
+        """Добавить уже готовый (in-process) клиент в реестр.
+
+        Нужен для встроенных источников тулов вроде `LocalFilesystemClient`,
+        которые не поднимаются из конфига, а собираются в composition root.
+        Клиент стартуется здесь же; сброс кэша тулов — чтобы `all_tools()`
+        увидел его тулы.
+        """
+        client.start()
+        self._clients[client.server_id] = client
+        self._tools_cache = None
+
     def shutdown(self) -> None:
         for client in list(self._clients.values()):
             try:

@@ -100,6 +100,8 @@ from infra.knowledge_repository import FileKnowledgeRepository
 from infra.mcp_config_repository import FileMcpConfigRepository
 from infra.mcp_git import McpGitContextProvider
 from infra.mcp_registry import StdioMcpRegistry
+from infra.local_fs_client import LocalFilesystemClient
+from cli.fs_confirm import make_interactive_confirm
 from infra.pr_diff import GhDiffProvider
 from infra.profile_repository import FileProfileRepository
 from infra.query_rewriter import LLMQueryRewriter
@@ -237,6 +239,24 @@ def main():
         or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
     git_provider = McpGitContextProvider(mcp_registry, repo_path)
+
+    # Встроенный источник файловых тулов: агент читает/ищет/пишет файлы проекта
+    # прямо в tool-loop, без внешнего MCP-сервера. Sandbox-root по умолчанию —
+    # текущий рабочий каталог (откуда запустили jarvis), поэтому можно открыть
+    # терминал в любом проекте и подключить агента к нему. Переопределяется
+    # JARVIS_FS_ROOT. Запись проходит через интерактивный confirm с цветным diff.
+    fs_root = os.path.expanduser(
+        os.environ.get("JARVIS_FS_ROOT", "").strip() or os.getcwd()
+    )
+    try:
+        fs_client = LocalFilesystemClient(
+            root    = fs_root,
+            confirm = make_interactive_confirm(reader=read_input),
+        )
+        mcp_registry.register(fs_client)
+        print(f"{DIM}Файловые тулы (fs) активны на {fs_root}.{RESET}")
+    except Exception as e:
+        print(f"{YELLOW}Файловые тулы не поднялись: {e}{RESET}")
 
     tool_router = ToolRouter(client, mcp_registry) \
         if provider == DEEPSEEK and mcp_registry.all_tools() else None
