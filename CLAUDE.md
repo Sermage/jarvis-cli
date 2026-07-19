@@ -49,6 +49,17 @@
 1. **В prompt** — `build_system_prompt()` добавляет блок `[ИНВАРИАНТЫ — …]` с явным правилом отказа от запросов, противоречащих ограничениям.
 2. **Пост-проверка** — `app/invariant_guard.py::guarded_chat()` прогоняет ответ модели через `InvariantSet.check()`. При block-нарушениях — feedback-ретрай с просьбой переделать (до `max_retries`, по умолчанию 1). warn — не блокирует, но возвращается в UI. Используется и в обычном чате (`cli/main.py`), и в стадиях задачи (`app/task_driver.py::advance_task`). В `advance_task` информация о нарушениях кладётся в `stage_obj.artifacts["invariant_violations"]` для отладки.
 
+## Файловые тулы (fs)
+
+Встроенный источник инструментов, дающий агенту реальную работу с файлами проекта прямо в tool-loop — без внешнего MCP-сервера.
+
+- Реализация: `infra/local_fs_client.py::LocalFilesystemClient` — тот же протокол `McpClient` (`start/list_tools/call_tool/close`), но операции идут в ФС напрямую, не по JSON-RPC. За счёт этого клиент встаёт в `McpRegistry.register()`, а `ToolRouter` сам отдаёт его тулы модели и роутит вызовы `fs__*` (правок в tool-loop не потребовалось).
+- Тулы: `fs__list_dir`, `fs__read_file`, `fs__search` (grep по дереву, glob/regex), `fs__write_file`.
+- **Sandbox**: все пути резолвятся внутри корня (`JARVIS_FS_ROOT`, по умолчанию — текущий рабочий каталог, откуда запущен `jarvis`, поэтому агента можно подключить к любому проекту из его терминала); выход за него (`..`, симлинк) отклоняется. Служебные каталоги (`.git`, `.venv`, `__pycache__`, …) не обходятся.
+- **Запись = diff + подтверждение**: `write_file` считает unified diff и вызывает инъектируемый `confirm(rel, diff) -> bool`. В CLI — `cli/fs_confirm.py::make_interactive_confirm` печатает **цветной diff** (удалённые строки красным, добавленные зелёным) и спрашивает y/n; без подтверждения запись не происходит. В тестах/демо confirm подменяется.
+- Активируется только при `provider=deepseek` (tool calling). Сборка — в composition root (`cli/main.py`).
+- Демо (воспроизводимо, без ключа — `JARVIS_DEMO_SCRIPTED=1`): `examples/fs_agent_demo.py` — агент по цели сам ищет использования API и генерирует ADR.
+
 ## Конвенции
 
 - Все пользовательские данные — в `~/.jarvis/`, не в репо
