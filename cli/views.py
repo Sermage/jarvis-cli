@@ -362,6 +362,7 @@ def print_help() -> None:
   {CYAN}/help{RESET}            — эта справка
   {CYAN}/help <вопрос>{RESET}   — ответ о проекте по документации (RAG) + git-ветка через MCP
   {CYAN}/review <PR>{RESET}     — AI-ревью пул-реквеста: diff через GitHub + RAG (доки+код)
+  {CYAN}/support <вопрос> [#T-1024]{RESET} — поддержка: ответ по FAQ (RAG) + контекст тикета (MCP)
 
 {DIM}Что куда сохраняется:
   краткосрочная → текущий диалог (messages), авто

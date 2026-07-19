@@ -60,6 +60,16 @@
 - Активируется только при `provider=deepseek` (tool calling). Сборка — в composition root (`cli/main.py`).
 - Демо (воспроизводимо, без ключа — `JARVIS_DEMO_SCRIPTED=1`): `examples/fs_agent_demo.py` — агент по цели сам ищет использования API и генерирует ADR.
 
+## Ассистент поддержки (/support)
+
+Мини-сервис поддержки пользователей: отвечает на вопрос о продукте по FAQ (RAG) с учётом контекста тикета/пользователя (MCP). `/support <вопрос> [#T-1024]`. Это брат-близнец `/help`: FAQ вместо доков, тикеты вместо git-ветки.
+
+- **RAG по FAQ**: `infra/faq_retrieval.py::MarkdownFaqRetrievalEngine` — реализует порт `RetrievalEngine`, лексический поиск по `docs/support-faq/*.md` (чанки по `##`-разделам), ноль внешних зависимостей. Взаимозаменяем с FAISS-движком через тот же порт (`JARVIS_FAQ_DIR` переопределяет каталог).
+- **Тикеты через MCP**: `infra/ticket_store_client.py::TicketStoreClient` — in-process `McpClient` над JSON `~/.jarvis/support/tickets.json` (users + tickets), по образцу `LocalFilesystemClient`. Встаёт в `McpRegistry.register()`; тулы `support__get_ticket · get_user · search_tickets` агент вызывает сам в tool-loop. Файл сидируется примером при первом запуске (`_seed_support_tickets`); `JARVIS_SUPPORT_TICKETS` переопределяет путь. Заменить на реальный CRM = поднять внешний MCP-сервер в конфиге, use case не изменится.
+- **Use case**: `app/support_assistant.py::answer_support_question` — оркеструет `RetrievalEngine` + `SupportChat` (порт tool-loop). `SupportChat` реализует `ToolRouter` (полный tool-loop) или `PlainChatAdapter` (деградация без tool calling — ответ только по FAQ).
+- Полноценный доступ к тикетам — только при `provider=deepseek` (tool calling). Сборка — в composition root (`cli/main.py`).
+- Демо (без ключа — `JARVIS_DEMO_SCRIPTED=1`): `examples/support_agent_demo.py` — «Почему не работает авторизация? #T-1024» → агент поднимает тикет (Free + SSO ⇒ 403), читает FAQ, отвечает адресно.
+
 ## Конвенции
 
 - Все пользовательские данные — в `~/.jarvis/`, не в репо

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Optional
@@ -42,6 +43,7 @@ from cli.config import (
     OLLAMA,
     OLLAMA_BASE_URL,
     PROFILES_DIR,
+    SUPPORT_TICKETS_FILE,
     TASKS_DIR,
     WORKING_DIR,
     DEFAULT_EMBED_MODEL,
@@ -101,7 +103,11 @@ from infra.mcp_config_repository import FileMcpConfigRepository
 from infra.mcp_git import McpGitContextProvider
 from infra.mcp_registry import StdioMcpRegistry
 from infra.local_fs_client import LocalFilesystemClient
+from infra.ticket_store_client import TicketStoreClient, TicketStoreError
+from infra.faq_retrieval import MarkdownFaqRetrievalEngine
 from cli.fs_confirm import make_interactive_confirm
+from cli.support_commands import handle_support
+from app.support_assistant import PlainChatAdapter
 from infra.pr_diff import GhDiffProvider
 from infra.profile_repository import FileProfileRepository
 from infra.query_rewriter import LLMQueryRewriter
@@ -113,6 +119,48 @@ from infra.working_memory_repository import FileWorkingMemoryRepository
 
 
 _YES = {"y", "yes", "да", "д"}
+
+
+# Пример стора тикетов: создаётся при первом запуске, если файла ещё нет.
+# Данные согласованы с FAQ (docs/support-faq), чтобы /support давал связный
+# ответ «из коробки». Пользователь потом правит этот JSON под свой продукт.
+_SAMPLE_TICKETS = {
+    "users": [
+        {"id": "U-100", "name": "Иван Петров", "email": "ivan@example.com",
+         "plan": "Free", "auth_method": "SSO (Google)", "platform": "web"},
+        {"id": "U-200", "name": "Мария Client", "email": "maria@corp.example",
+         "plan": "Business", "auth_method": "email+пароль", "platform": "iOS"},
+    ],
+    "tickets": [
+        {"id": "T-1024", "user_id": "U-100", "status": "open", "priority": "high",
+         "product_area": "auth", "error_code": "403",
+         "subject": "Не могу войти через Google",
+         "created_at": "2026-07-18",
+         "messages": [
+             {"author": "user", "text": "При входе через Google выдаёт ошибку 403."},
+             {"author": "support", "text": "Уточните, включён ли SSO в вашем тарифе?"},
+         ]},
+        {"id": "T-1042", "user_id": "U-200", "status": "pending", "priority": "normal",
+         "product_area": "billing",
+         "subject": "Как перейти на годовую оплату",
+         "created_at": "2026-07-17",
+         "messages": [
+             {"author": "user", "text": "Хочу перейти с месячной на годовую подписку."},
+         ]},
+    ],
+}
+
+
+def _seed_support_tickets(path: str) -> None:
+    """Создать пример стора тикетов, если файла ещё нет. Ошибки — не критичны."""
+    try:
+        if os.path.exists(path):
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_SAMPLE_TICKETS, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass  # не смогли записать — /support просто скажет, что стор недоступен
 
 
 def _build_client(provider: str) -> LLMClient:
@@ -258,6 +306,29 @@ def main():
     except Exception as e:
         print(f"{YELLOW}Файловые тулы не поднялись: {e}{RESET}")
 
+    # Ассистент поддержки: JSON-стор тикетов как MCP-CRM (in-process клиент)
+    # плюс RAG по FAQ. Файл тикетов сидируется примером при первом запуске.
+    # Переопределяется JARVIS_SUPPORT_TICKETS / JARVIS_FAQ_DIR.
+    tickets_file = os.path.expanduser(
+        os.environ.get("JARVIS_SUPPORT_TICKETS", "").strip() or SUPPORT_TICKETS_FILE
+    )
+    _seed_support_tickets(tickets_file)
+    try:
+        support_client = TicketStoreClient(path=tickets_file)
+        mcp_registry.register(support_client)
+        print(f"{DIM}Стор тикетов (support) активен: {tickets_file}.{RESET}")
+    except TicketStoreError as e:
+        print(f"{YELLOW}Стор тикетов не поднялся: {e}{RESET}")
+
+    faq_dir = os.path.expanduser(
+        os.environ.get("JARVIS_FAQ_DIR", "").strip()
+        or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "docs", "support-faq")
+    )
+    faq_engine = MarkdownFaqRetrievalEngine(faq_dir)
+    if faq_engine.is_ready():
+        print(f"{DIM}FAQ поддержки: {faq_dir}.{RESET}")
+
     tool_router = ToolRouter(client, mcp_registry) \
         if provider == DEEPSEEK and mcp_registry.all_tools() else None
     if tool_router is not None:
@@ -265,6 +336,10 @@ def main():
     elif provider != DEEPSEEK and mcp_repo.list_all():
         print(f"{YELLOW}MCP-серверы настроены, но tool calling доступен только "
               f"для DeepSeek. Переключи /provider deepseek.{RESET}\n")
+
+    # /support использует tool-loop для доступа к тикетам через MCP; без него
+    # (провайдер без tool calling) — деградация до ответа только по FAQ.
+    support_chat = tool_router if tool_router is not None else PlainChatAdapter(client)
 
     # Инициализация долговременной памяти
     current_profile: Optional[Profile] = profile_repo.ensure_default()
@@ -368,6 +443,8 @@ def main():
                     client = _build_client(provider)
                     tool_router = ToolRouter(client, mcp_registry) \
                         if provider == DEEPSEEK and mcp_registry.all_tools() else None
+                    support_chat = tool_router if tool_router is not None \
+                        else PlainChatAdapter(client)
                     print(f"{GREEN}Провайдер переключён: {provider}{RESET}")
                     print(f"{DIM}модель сброшена на дефолт: {params['model']}{RESET}")
                     if tool_router is not None:
@@ -383,6 +460,7 @@ def main():
                     provider = OLLAMA
                     client = _build_client(provider)
                     tool_router = None
+                    support_chat = PlainChatAdapter(client)
                     installed = client.list_models() if hasattr(client, "list_models") else []
                     if installed:
                         params["model"] = installed[0]
@@ -444,6 +522,9 @@ def main():
             elif cmd == "/review" or cmd.startswith("/review "):
                 handle_review(user_input, review_engine, diff_provider, client,
                               params, top_k=rag_config.top_k)
+            elif cmd == "/support" or cmd.startswith("/support "):
+                handle_support(user_input, faq_engine, support_chat, params,
+                               top_k=rag_config.top_k)
             else:
                 print(f"{YELLOW}Неизвестная команда. Введите /help.{RESET}")
             continue
